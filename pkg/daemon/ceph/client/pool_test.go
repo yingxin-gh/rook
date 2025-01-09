@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"testing"
 
+	"golang.org/x/exp/slices"
+
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
@@ -93,7 +95,7 @@ func testCreateECPool(t *testing.T, overwrite bool, compressionMode string) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := createECPoolForApp(context, AdminTestClusterInfo("mycluster"), "mypoolprofile", p, DefaultPGCount, "myapp", overwrite)
+	err := createECPoolForApp(context, AdminTestClusterInfo("mycluster"), "mypoolprofile", p, DefaultPGCount, overwrite)
 	assert.Nil(t, err)
 	if compressionMode != "" {
 		assert.True(t, compressionModeCreated)
@@ -177,6 +179,11 @@ func testCreateReplicaPool(t *testing.T, failureDomain, crushRoot, deviceClass, 
 				assert.Equal(t, "12345", args[8])
 				return "", nil
 			}
+			if args[2] == "get" {
+				assert.Equal(t, "mypool", args[3])
+				assert.Equal(t, "all", args[4])
+				return `{"pool":"replicapool","pool_id":2,"size":1,"min_size":1,"crush_rule":"replicapool_osd"}`, nil
+			}
 			if args[2] == "set" {
 				assert.Equal(t, "mypool", args[3])
 				if args[4] == "size" {
@@ -201,8 +208,12 @@ func testCreateReplicaPool(t *testing.T, failureDomain, crushRoot, deviceClass, 
 		if args[1] == "crush" {
 			crushRuleCreated = true
 			assert.Equal(t, "rule", args[2])
+			if args[3] == "dump" {
+				assert.Equal(t, "replicapool_osd", args[4])
+				return `{"rule_id": 3,"rule_name": "replicapool_osd","type": 1}`, nil
+			}
 			assert.Equal(t, "create-replicated", args[3])
-			assert.Equal(t, "mypool", args[4])
+			assert.Contains(t, args[4], "mypool")
 			if crushRoot == "" {
 				assert.Equal(t, "cluster-crush-root", args[5])
 			} else {
@@ -214,7 +225,7 @@ func testCreateReplicaPool(t *testing.T, failureDomain, crushRoot, deviceClass, 
 				assert.Equal(t, failureDomain, args[6])
 			}
 			if deviceClass == "" {
-				assert.False(t, testIsStringInSlice("hdd", args))
+				assert.False(t, slices.Contains(args, "hdd"))
 			} else {
 				assert.Equal(t, deviceClass, args[7])
 			}
@@ -234,7 +245,7 @@ func testCreateReplicaPool(t *testing.T, failureDomain, crushRoot, deviceClass, 
 		p.CompressionMode = compressionMode
 	}
 	clusterSpec := &cephv1.ClusterSpec{Storage: cephv1.StorageScopeSpec{Config: map[string]string{CrushRootConfigKey: "cluster-crush-root"}}}
-	err := createReplicatedPoolForApp(context, AdminTestClusterInfo("mycluster"), clusterSpec, p, DefaultPGCount, "myapp")
+	err := createReplicatedPoolForApp(context, AdminTestClusterInfo("mycluster"), clusterSpec, p, DefaultPGCount)
 	assert.Nil(t, err)
 	assert.True(t, crushRuleCreated)
 	if compressionMode != "" {
@@ -247,14 +258,18 @@ func testCreateReplicaPool(t *testing.T, failureDomain, crushRoot, deviceClass, 
 func TestUpdateFailureDomain(t *testing.T) {
 	var newCrushRule string
 	currentFailureDomain := "rack"
+	currentDeviceClass := "default"
+	testCrushRuleName := "test_rule"
+	cephCommandCalled := false
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
 	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
+		cephCommandCalled = true
 		if args[1] == "pool" {
 			if args[2] == "get" {
 				assert.Equal(t, "mypool", args[3])
-				return `{"crush_rule": "test_rule"}`, nil
+				return fmt.Sprintf(`{"crush_rule": "%s"}`, testCrushRuleName), nil
 			}
 			if args[2] == "set" {
 				assert.Equal(t, "mypool", args[3])
@@ -265,7 +280,7 @@ func TestUpdateFailureDomain(t *testing.T) {
 		}
 		if args[1] == "crush" {
 			if args[2] == "rule" && args[3] == "dump" {
-				return fmt.Sprintf(`{"steps": [{"foo":"bar"},{"type":"%s"}]}`, currentFailureDomain), nil
+				return fmt.Sprintf(`{"steps": [{"item_name":"%s"},{"type":"%s"}]}`, currentDeviceClass, currentFailureDomain), nil
 			}
 			newCrushRule = "foo"
 			return "", nil
@@ -277,7 +292,8 @@ func TestUpdateFailureDomain(t *testing.T) {
 		p := cephv1.NamedPoolSpec{
 			Name: "mypool",
 			PoolSpec: cephv1.PoolSpec{
-				Replicated: cephv1.ReplicatedSpec{Size: 3},
+				Replicated:         cephv1.ReplicatedSpec{Size: 3},
+				EnableCrushUpdates: true,
 			},
 		}
 		clusterSpec := &cephv1.ClusterSpec{Storage: cephv1.StorageScopeSpec{}}
@@ -290,7 +306,23 @@ func TestUpdateFailureDomain(t *testing.T) {
 		p := cephv1.NamedPoolSpec{
 			Name: "mypool",
 			PoolSpec: cephv1.PoolSpec{
-				FailureDomain: currentFailureDomain,
+				FailureDomain:      currentFailureDomain,
+				Replicated:         cephv1.ReplicatedSpec{Size: 3},
+				EnableCrushUpdates: true,
+			},
+		}
+		testCrushRuleName = "mypool_rack"
+		clusterSpec := &cephv1.ClusterSpec{Storage: cephv1.StorageScopeSpec{}}
+		err := updatePoolCrushRule(context, AdminTestClusterInfo("mycluster"), clusterSpec, p)
+		assert.NoError(t, err)
+		assert.Equal(t, "", newCrushRule)
+	})
+
+	t.Run("trying to change failure domain without enabling EnableCrushUpdates", func(t *testing.T) {
+		p := cephv1.NamedPoolSpec{
+			Name: "mypool",
+			PoolSpec: cephv1.PoolSpec{
+				FailureDomain: "zone",
 				Replicated:    cephv1.ReplicatedSpec{Size: 3},
 			},
 		}
@@ -304,14 +336,36 @@ func TestUpdateFailureDomain(t *testing.T) {
 		p := cephv1.NamedPoolSpec{
 			Name: "mypool",
 			PoolSpec: cephv1.PoolSpec{
-				FailureDomain: "zone",
-				Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				FailureDomain:      "zone",
+				Replicated:         cephv1.ReplicatedSpec{Size: 3},
+				EnableCrushUpdates: true,
 			},
 		}
 		clusterSpec := &cephv1.ClusterSpec{Storage: cephv1.StorageScopeSpec{}}
 		err := updatePoolCrushRule(context, AdminTestClusterInfo("mycluster"), clusterSpec, p)
 		assert.NoError(t, err)
 		assert.Equal(t, "mypool_zone", newCrushRule)
+	})
+
+	t.Run("stretch cluster skips crush rule update", func(t *testing.T) {
+		p := cephv1.NamedPoolSpec{
+			Name: "mypool",
+			PoolSpec: cephv1.PoolSpec{
+				FailureDomain:      "zone",
+				Replicated:         cephv1.ReplicatedSpec{Size: 3},
+				EnableCrushUpdates: true,
+			},
+		}
+		clusterSpec := &cephv1.ClusterSpec{
+			Mon:     cephv1.MonSpec{StretchCluster: &cephv1.StretchClusterSpec{Zones: []cephv1.MonZoneSpec{{Name: "zone1"}, {Name: "zone2"}, {Name: "zone3", Arbiter: true}}}},
+			Storage: cephv1.StorageScopeSpec{},
+		}
+		newCrushRule = ""
+		cephCommandCalled = false
+		err := updatePoolCrushRule(context, AdminTestClusterInfo("mycluster"), clusterSpec, p)
+		assert.NoError(t, err)
+		assert.Equal(t, "", newCrushRule)
+		assert.False(t, cephCommandCalled)
 	})
 }
 
@@ -334,15 +388,16 @@ func TestExtractPoolDetails(t *testing.T) {
 		assert.Equal(t, "zone", failureDomain)
 		assert.Equal(t, "ssd", deviceClass)
 	})
-}
 
-func testIsStringInSlice(a string, list []string) bool {
-	for _, b := range list {
-		if b == a {
-			return true
-		}
-	}
-	return false
+	t.Run("valid crush rule with crushroot combined", func(t *testing.T) {
+		rule := ruleSpec{Steps: []stepSpec{
+			{Type: ""},
+			{Type: "zone", ItemName: "default~ssd"},
+		}}
+		failureDomain, deviceClass := extractPoolDetails(rule)
+		assert.Equal(t, "zone", failureDomain)
+		assert.Equal(t, "ssd", deviceClass)
+	})
 }
 
 func TestGetPoolStatistics(t *testing.T) {
@@ -517,7 +572,8 @@ func testCreatePoolWithReplicasPerFailureDomain(t *testing.T, failureDomain, cru
 			assert.Equal(t, args[4], "size")
 			poolSize, err := strconv.Atoi(args[5])
 			assert.NoError(t, err)
-			assert.Equal(t, uint(poolSize), poolSpec.Replicated.Size)
+			uPoolSize := uint(poolSize) // nolint:gosec // G115 : we know it is not too big
+			assert.Equal(t, uPoolSize, poolSpec.Replicated.Size)
 			poolRuleSet = true
 			return "", nil
 		}
@@ -543,7 +599,7 @@ func testCreatePoolWithReplicasPerFailureDomain(t *testing.T, failureDomain, cru
 	}
 	context := &clusterd.Context{Executor: executor}
 	clusterSpec := &cephv1.ClusterSpec{Storage: cephv1.StorageScopeSpec{Config: map[string]string{CrushRootConfigKey: "cluster-crush-root"}}}
-	err := createReplicatedPoolForApp(context, AdminTestClusterInfo("mycluster"), clusterSpec, poolSpec, DefaultPGCount, "myapp")
+	err := createReplicatedPoolForApp(context, AdminTestClusterInfo("mycluster"), clusterSpec, poolSpec, DefaultPGCount)
 	assert.Nil(t, err)
 	assert.True(t, poolRuleCreated)
 	assert.True(t, poolRuleSet)

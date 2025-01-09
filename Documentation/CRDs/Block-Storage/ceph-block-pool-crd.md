@@ -60,7 +60,7 @@ spec:
 This sample will lower the overall storage capacity requirement, while also adding redundancy by using [erasure coding](#erasure-coding).
 
 !!! note
-    This sample requires *at least 3 bluestore OSDs*.
+    This sample requires **at least 3 bluestore OSDs**.
 
 The OSDs can be located on a single Ceph node or spread across multiple nodes, because the [`failureDomain`](ceph-block-pool-crd.md#spec) is set to `osd` and the `erasureCoded` chunk settings require at least 3 different OSDs (2 `dataChunks` + 1 `codingChunks`).
 
@@ -135,6 +135,10 @@ external-cluster-console # rbd mirror pool peer bootstrap import <token file pat
 
 See the official rbd mirror documentation on [how to add a bootstrap peer](https://docs.ceph.com/docs/master/rbd/rbd-mirroring/#bootstrap-peers).
 
+!!! note
+    Disabling mirroring for the CephBlockPool requires disabling mirroring on all the
+    CephBlockPoolRadosNamespaces present underneath.
+
 ### Data spread across subdomains
 
 Imagine the following topology with datacenters containing racks and then hosts:
@@ -200,12 +204,15 @@ stretched) then you will have 2 replicas per datacenter where each replica ends 
         Neither Rook, nor Ceph, prevent the creation of a cluster where the replicated data (or Erasure Coded chunks) can be written safely. By design, Ceph will delay checking for suitable OSDs until a write request is made and this write can hang if there are not sufficient OSDs to satisfy the request.
 * `deviceClass`: Sets up the CRUSH rule for the pool to distribute data only on the specified device class. If left empty or unspecified, the pool will use the cluster's default CRUSH root, which usually distributes data over all OSDs, regardless of their class. If `deviceClass` is specified on any pool, ensure that it is added to every pool in the cluster, otherwise Ceph will warn about pools with overlapping roots.
 * `crushRoot`: The root in the crush map to be used by the pool. If left empty or unspecified, the default root will be used. Creating a crush hierarchy for the OSDs currently requires the Rook toolbox to run the Ceph tools described [here](http://docs.ceph.com/docs/master/rados/operations/crush-map/#modifying-the-crush-map).
+* `enableCrushUpdates`: Enables rook to update the pool crush rule using Pool Spec. Can cause data remapping if crush rule changes, Defaults to false.
 * `enableRBDStats`: Enables collecting RBD per-image IO statistics by enabling dynamic OSD performance counters. Defaults to false. For more info see the [ceph documentation](https://docs.ceph.com/docs/master/mgr/prometheus/#rbd-io-statistics).
 * `name`: The name of Ceph pools is based on the `metadata.name` of the CephBlockPool CR. Some built-in Ceph pools
-  require names that are incompatible with K8s resource names. These special pools can be configured
-  by setting this `name` to override the name of the Ceph pool that is created instead of using the `metadata.name` for the pool.
-  Only the following pool names are supported: `device_health_metrics`, `.nfs`, and `.mgr`. See the example
-  [builtin mgr pool](https://github.com/rook/rook/blob/master/deploy/examples/pool-builtin-mgr.yaml).
+    require names that are incompatible with K8s resource names. These special pools can be configured
+    by setting this `name` to override the name of the Ceph pool that is created instead of using the `metadata.name` for the pool.
+    Only the following pool names are supported: `.nfs`, `.mgr`, and `.rgw.root`. See the example
+    [builtin mgr pool](https://github.com/rook/rook/blob/master/deploy/examples/pool-builtin-mgr.yaml).
+* `application`: The type of application set on the pool. By default, Ceph pools for CephBlockPools will be `rbd`,
+    CephObjectStore pools will be `rgw`, and CephFilesystem pools will be `cephfs`.
 
 * `parameters`: Sets any [parameters](https://docs.ceph.com/docs/master/rados/operations/pools/#set-pool-values) listed to the given pool
     * `target_size_ratio:` gives a hint (%) to Ceph in terms of expected consumption of the total cluster capacity of a given pool, for more info see the [ceph documentation](https://docs.ceph.com/docs/master/rados/operations/placement-groups/#specifying-expected-pool-size)

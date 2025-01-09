@@ -17,51 +17,118 @@ limitations under the License.
 package csi
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
+	cephcsi "github.com/ceph/ceph-csi/api/deploy/kubernetes"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/cluster/osd/topology"
+	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/operator/test"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
-func TestUpdateCsiClusterConfig(t *testing.T) {
-	csiClusterConfigEntry := CsiClusterConfigEntry{
-		Namespace: "rook-ceph-1",
-		Monitors:  []string{"1.2.3.4:5000"},
+func unmarshal(s string) ([]CSIClusterConfigEntry, error) {
+	var csiClusterConfigEntry []CSIClusterConfigEntry
+	if err := json.Unmarshal([]byte(s), &csiClusterConfigEntry); err != nil {
+		return csiClusterConfigEntry, err
 	}
-	csiClusterConfigEntryMultus := CsiClusterConfigEntry{
+
+	return csiClusterConfigEntry, nil
+}
+
+func compareJSON(t *testing.T, exceptedJSON, actualJSON string) {
+	var (
+		err              error
+		expected, actual []CSIClusterConfigEntry
+	)
+
+	expected, err = unmarshal(exceptedJSON)
+	if err != nil {
+		t.Error(err)
+	}
+	actual, err = unmarshal(exceptedJSON)
+	if err != nil {
+		t.Error(err)
+	}
+
+	assert.Equal(t, expected, actual)
+}
+
+func TestUpdateCsiClusterConfig(t *testing.T) {
+	csiClusterConfigEntry := CSIClusterConfigEntry{
 		Namespace: "rook-ceph-1",
-		Monitors:  []string{"1.2.3.4:5000"},
-		RBD: &CsiRBDSpec{
-			NetNamespaceFilePath: "/var/run/netns/rook-ceph-1",
-			RadosNamespace:       "rook-ceph-1",
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: []string{"1.2.3.4:5000"},
 		},
 	}
-	csiClusterConfigEntry2 := CsiClusterConfigEntry{
-		Namespace: "rook-ceph-2",
-		Monitors:  []string{"20.1.1.1:5000", "20.1.1.2:5000", "20.1.1.3:5000"},
+	csiClusterConfigEntryMultus := CSIClusterConfigEntry{
+		Namespace: "rook-ceph-1",
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: []string{"1.2.3.4:5000"},
+			RBD: cephcsi.RBD{
+				NetNamespaceFilePath: "/var/run/netns/rook-ceph-1",
+				RadosNamespace:       "rook-ceph-1",
+			},
+		},
 	}
-	csiClusterConfigEntry3 := CsiClusterConfigEntry{
+	csiClusterConfigEntryMountOptions := CSIClusterConfigEntry{
+		Namespace: "rook-ceph-1",
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: []string{"1.2.3.4:5000"},
+			CephFS: cephcsi.CephFS{
+				KernelMountOptions: "ms_mode=crc",
+				FuseMountOptions:   "debug",
+			},
+		},
+	}
+	csiClusterConfigEntry2 := CSIClusterConfigEntry{
+		Namespace: "rook-ceph-2",
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: []string{"20.1.1.1:5000", "20.1.1.2:5000", "20.1.1.3:5000"},
+		},
+	}
+	csiClusterConfigEntry3 := CSIClusterConfigEntry{
 		Namespace: "rook-ceph-3",
-		Monitors:  []string{"10.1.1.1:5000", "10.1.1.2:5000", "10.1.1.3:5000"},
-		CephFS: &CsiCephFSSpec{
-			SubvolumeGroup: "my-group",
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: []string{"10.1.1.1:5000", "10.1.1.2:5000", "10.1.1.3:5000"},
+			CephFS: cephcsi.CephFS{
+				SubvolumeGroup: "my-group",
+			},
+		},
+	}
+	csiClusterConfigEntry4 := CSIClusterConfigEntry{
+		Namespace: "rook-ceph-4",
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: []string{"10.1.1.1:5000"},
+			ReadAffinity: cephcsi.ReadAffinity{
+				Enabled:             true,
+				CrushLocationLabels: strings.Split(topology.GetDefaultTopologyLabels(), ","),
+			},
 		},
 	}
 
-	var s string
+	var want, s string
 	var err error
 
 	t.Run("add a simple mons list", func(t *testing.T) {
-		s, err = updateCsiClusterConfig("[]", "rook-ceph-1", &csiClusterConfigEntry)
+		s, err = updateCsiClusterConfig("[]", "rook-ceph-1", "rook-ceph-1", &csiClusterConfigEntry)
 		assert.NoError(t, err)
-		assert.Equal(t, `[{"clusterID":"rook-ceph-1","monitors":["1.2.3.4:5000"],"namespace":"rook-ceph-1"}]`, s)
+		want = `[{"clusterID":"rook-ceph-1","monitors":["1.2.3.4:5000"],"namespace":"rook-ceph-1"}]`
+		compareJSON(t, want, s)
 	})
 
 	t.Run("add a 2nd mon to the current cluster", func(t *testing.T) {
 		csiClusterConfigEntry.Monitors = append(csiClusterConfigEntry.Monitors, "10.11.12.13:5000")
-		s, err = updateCsiClusterConfig(s, "rook-ceph-1", &csiClusterConfigEntry)
+		s, err = updateCsiClusterConfig(s, "rook-ceph-1", "rook-ceph-1", &csiClusterConfigEntry)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -72,8 +139,19 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		assert.Equal(t, 2, len(cc[0].Monitors))
 	})
 
+	t.Run("add mount options to the current cluster", func(t *testing.T) {
+		configWithMountOptions, err := updateCsiClusterConfig(s, "rook-ceph-1", "rook-ceph-1", &csiClusterConfigEntryMountOptions)
+		assert.NoError(t, err)
+		cc, err := parseCsiClusterConfig(configWithMountOptions)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(cc))
+		assert.Equal(t, "rook-ceph-1", cc[0].ClusterID)
+		assert.Equal(t, csiClusterConfigEntryMountOptions.CephFS.KernelMountOptions, cc[0].CephFS.KernelMountOptions)
+		assert.Equal(t, csiClusterConfigEntryMountOptions.CephFS.FuseMountOptions, cc[0].CephFS.FuseMountOptions)
+	})
+
 	t.Run("add a 2nd cluster with 3 mons", func(t *testing.T) {
-		s, err = updateCsiClusterConfig(s, "beta", &csiClusterConfigEntry2)
+		s, err = updateCsiClusterConfig(s, "beta", "beta", &csiClusterConfigEntry2)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -97,7 +175,7 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		i := 2
 		// Remove last element of the slice
 		csiClusterConfigEntry2.Monitors = append(csiClusterConfigEntry2.Monitors[:i], csiClusterConfigEntry2.Monitors[i+1:]...)
-		s, err = updateCsiClusterConfig(s, "beta", &csiClusterConfigEntry2)
+		s, err = updateCsiClusterConfig(s, "beta", "beta", &csiClusterConfigEntry2)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -113,7 +191,7 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 	})
 
 	t.Run("add a 3rd cluster with subvolumegroup", func(t *testing.T) {
-		s, err = updateCsiClusterConfig(s, "baba", &csiClusterConfigEntry3)
+		s, err = updateCsiClusterConfig(s, "baba", "baba", &csiClusterConfigEntry3)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -125,12 +203,24 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		assert.Equal(t, "10.1.1.1:5000", cc[2].Monitors[0])
 		assert.Equal(t, 3, len(cc[2].Monitors))
 		assert.Equal(t, "my-group", cc[2].CephFS.SubvolumeGroup)
+	})
+
+	t.Run("update mount options in presence of subvolumegroup", func(t *testing.T) {
+		sMntOptionUpdate, err := updateCsiClusterConfig(s, "baba", "baba", &csiClusterConfigEntryMountOptions)
+		assert.NoError(t, err)
+		cc, err := parseCsiClusterConfig(sMntOptionUpdate)
+		assert.NoError(t, err)
+		assert.Equal(t, 3, len(cc))
+		assert.Equal(t, "baba", cc[2].ClusterID)
+		assert.Equal(t, "my-group", cc[2].CephFS.SubvolumeGroup)
+		assert.Equal(t, csiClusterConfigEntryMountOptions.CephFS.KernelMountOptions, cc[2].CephFS.KernelMountOptions)
+		assert.Equal(t, csiClusterConfigEntryMountOptions.CephFS.FuseMountOptions, cc[2].CephFS.FuseMountOptions)
 
 	})
 
 	t.Run("add a 4th mon to the 3rd cluster and subvolumegroup is preserved", func(t *testing.T) {
 		csiClusterConfigEntry3.Monitors = append(csiClusterConfigEntry3.Monitors, "10.11.12.13:5000")
-		s, err = updateCsiClusterConfig(s, "baba", &csiClusterConfigEntry3)
+		s, err = updateCsiClusterConfig(s, "baba", "baba", &csiClusterConfigEntry3)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -141,7 +231,7 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 
 	t.Run("remove subvolumegroup", func(t *testing.T) {
 		csiClusterConfigEntry3.CephFS.SubvolumeGroup = ""
-		s, err = updateCsiClusterConfig(s, "baba", nil)
+		s, err = updateCsiClusterConfig(s, "baba", "baba", nil)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -149,12 +239,14 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 	})
 
 	t.Run("add subvolumegroup and mons after", func(t *testing.T) {
-		csiClusterConfigEntry4 := CsiClusterConfigEntry{
-			CephFS: &CsiCephFSSpec{
-				SubvolumeGroup: "my-group2",
+		csiClusterConfigEntry4 := CSIClusterConfigEntry{
+			ClusterInfo: cephcsi.ClusterInfo{
+				CephFS: cephcsi.CephFS{
+					SubvolumeGroup: "my-group2",
+				},
 			},
 		}
-		s, err = updateCsiClusterConfig(s, "quatre", &csiClusterConfigEntry4)
+		s, err = updateCsiClusterConfig(s, "quatre", "quatre", &csiClusterConfigEntry4)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -163,7 +255,7 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		assert.Equal(t, "my-group2", cc[2].CephFS.SubvolumeGroup, cc)
 
 		csiClusterConfigEntry4.Monitors = []string{"10.1.1.1:5000", "10.1.1.2:5000", "10.1.1.3:5000"}
-		s, err = updateCsiClusterConfig(s, "quatre", &csiClusterConfigEntry4)
+		s, err = updateCsiClusterConfig(s, "quatre", "quatre", &csiClusterConfigEntry4)
 		assert.NoError(t, err)
 		cc, err = parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -172,7 +264,7 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 	})
 
 	t.Run("does it return error on garbage input?", func(t *testing.T) {
-		_, err = updateCsiClusterConfig("qqq", "beta", &csiClusterConfigEntry2)
+		_, err = updateCsiClusterConfig("qqq", "beta", "beta", &csiClusterConfigEntry2)
 		assert.Error(t, err)
 	})
 
@@ -181,23 +273,27 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		subvolGrpNameofCluster1 := "subvol-group"
 		radosNSofCluster1 := "rados-ns"
 
-		csiCluster1ConfigEntry := CsiClusterConfigEntry{
+		csiCluster1ConfigEntry := CSIClusterConfigEntry{
 			Namespace: clusterIDofCluster1,
-			Monitors:  []string{"1.2.3.4:5000"},
-		}
-		s, err := updateCsiClusterConfig("[]", clusterIDofCluster1, &csiCluster1ConfigEntry)
-		assert.NoError(t, err)
-		assert.Equal(t, s,
-			`[{"clusterID":"rook-ceph","monitors":["1.2.3.4:5000"],"namespace":"rook-ceph"}]`)
-		// add subvolumegroup to same cluster
-		subVolCsiCluster1Config := CsiClusterConfigEntry{
-			Namespace: clusterIDofCluster1,
-			Monitors:  csiCluster1ConfigEntry.Monitors,
-			CephFS: &CsiCephFSSpec{
-				SubvolumeGroup: subvolGrpNameofCluster1,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: []string{"1.2.3.4:5000"},
 			},
 		}
-		s, err = updateCsiClusterConfig(s, subvolGrpNameofCluster1, &subVolCsiCluster1Config)
+		s, err := updateCsiClusterConfig("[]", clusterIDofCluster1, clusterIDofCluster1, &csiCluster1ConfigEntry)
+		assert.NoError(t, err)
+		want = `[{"clusterID":"rook-ceph","monitors":["1.2.3.4:5000"],"namespace":"rook-ceph"}]`
+		compareJSON(t, want, s)
+		// add subvolumegroup to same cluster
+		subVolCsiCluster1Config := CSIClusterConfigEntry{
+			Namespace: clusterIDofCluster1,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: csiCluster1ConfigEntry.Monitors,
+				CephFS: cephcsi.CephFS{
+					SubvolumeGroup: subvolGrpNameofCluster1,
+				},
+			},
+		}
+		s, err = updateCsiClusterConfig(s, subvolGrpNameofCluster1, clusterIDofCluster1, &subVolCsiCluster1Config)
 		assert.NoError(t, err)
 		cc, err := parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -206,27 +302,26 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		assert.Equal(t, subvolGrpNameofCluster1, cc[1].CephFS.SubvolumeGroup, cc)
 
 		// add rados to same cluster
-		radosNsCsiCluster1Config := CsiClusterConfigEntry{
-			Namespace:      clusterIDofCluster1,
-			Monitors:       csiCluster1ConfigEntry.Monitors,
-			RadosNamespace: radosNSofCluster1,
-			RBD: &CsiRBDSpec{
-				RadosNamespace: radosNSofCluster1,
+		radosNsCsiCluster1Config := CSIClusterConfigEntry{
+			Namespace: clusterIDofCluster1,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: csiCluster1ConfigEntry.Monitors,
+				RBD: cephcsi.RBD{
+					RadosNamespace: radosNSofCluster1,
+				},
 			},
 		}
-		s, err = updateCsiClusterConfig(s, radosNSofCluster1, &radosNsCsiCluster1Config)
+		s, err = updateCsiClusterConfig(s, radosNSofCluster1, clusterIDofCluster1, &radosNsCsiCluster1Config)
 		assert.NoError(t, err)
 		cc, err = parseCsiClusterConfig(s)
 		assert.NoError(t, err)
 		assert.Equal(t, 3, len(cc), cc)
 		assert.Equal(t, 1, len(cc[2].Monitors))
-		// Now the configuration of new entries goes into RBD.RadosNamespace so it should be empty
-		assert.Empty(t, cc[2].RadosNamespace, cc)
 		assert.Equal(t, radosNSofCluster1, cc[2].RBD.RadosNamespace, cc)
 
 		// update mon IP's and check is it updating for all clusterID's
 		csiCluster1ConfigEntry.Monitors = append(csiCluster1ConfigEntry.Monitors, "1.2.3.10:5000")
-		s, err = updateCsiClusterConfig(s, clusterIDofCluster1, &csiCluster1ConfigEntry)
+		s, err = updateCsiClusterConfig(s, clusterIDofCluster1, clusterIDofCluster1, &csiCluster1ConfigEntry)
 		assert.NoError(t, err)
 		cc, err = parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -241,27 +336,35 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		radosNSofCluster2 := "rados-ns-2"
 
 		cluster2Mons := []string{"192.168.0.2:5000"}
-		csiCluster2ConfigEntry := CsiClusterConfigEntry{
+		csiCluster2ConfigEntry := CSIClusterConfigEntry{
 			Namespace: clusterIDofCluster2,
-			Monitors:  cluster2Mons,
-		}
-		subVolCsiCluster2Config := CsiClusterConfigEntry{
-			Namespace: clusterIDofCluster2,
-			Monitors:  cluster2Mons,
-			CephFS: &CsiCephFSSpec{
-				SubvolumeGroup: subvolGrpNameofCluster2,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: cluster2Mons,
 			},
 		}
-		radosNsCsiCluster2Config := CsiClusterConfigEntry{
-			Namespace:      clusterIDofCluster2,
-			Monitors:       cluster2Mons,
-			RadosNamespace: radosNSofCluster2,
+		subVolCsiCluster2Config := CSIClusterConfigEntry{
+			Namespace: clusterIDofCluster2,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: cluster2Mons,
+				CephFS: cephcsi.CephFS{
+					SubvolumeGroup: subvolGrpNameofCluster2,
+				},
+			},
 		}
-		s, err = updateCsiClusterConfig(s, clusterIDofCluster2, &csiCluster2ConfigEntry)
+		radosNsCsiCluster2Config := CSIClusterConfigEntry{
+			Namespace: clusterIDofCluster2,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: cluster2Mons,
+				RBD: cephcsi.RBD{
+					RadosNamespace: radosNSofCluster2,
+				},
+			},
+		}
+		s, err = updateCsiClusterConfig(s, clusterIDofCluster2, clusterIDofCluster2, &csiCluster2ConfigEntry)
 		assert.NoError(t, err)
-		s, err = updateCsiClusterConfig(s, subvolGrpNameofCluster2, &subVolCsiCluster2Config)
+		s, err = updateCsiClusterConfig(s, subvolGrpNameofCluster2, clusterIDofCluster2, &subVolCsiCluster2Config)
 		assert.NoError(t, err)
-		s, err = updateCsiClusterConfig(s, radosNSofCluster2, &radosNsCsiCluster2Config)
+		s, err = updateCsiClusterConfig(s, radosNSofCluster2, clusterIDofCluster2, &radosNsCsiCluster2Config)
 		assert.NoError(t, err)
 		cc, err = parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -280,7 +383,7 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		// update mon on 2nd cluster and check is it updating for all clusterID's
 		// of 2nd cluster
 		csiCluster2ConfigEntry.Monitors = append(csiCluster2ConfigEntry.Monitors, "192.168.0.3:5000")
-		s, err = updateCsiClusterConfig(s, clusterIDofCluster2, &csiCluster2ConfigEntry)
+		s, err = updateCsiClusterConfig(s, clusterIDofCluster2, clusterIDofCluster2, &csiCluster2ConfigEntry)
 		assert.NoError(t, err)
 		cc, err = parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -302,7 +405,7 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 		// clusterID's of 2nd cluster
 		i := 1
 		csiCluster2ConfigEntry.Monitors = append(csiCluster2ConfigEntry.Monitors[:i], csiCluster2ConfigEntry.Monitors[i+1:]...)
-		s, err = updateCsiClusterConfig(s, clusterIDofCluster2, &csiCluster2ConfigEntry)
+		s, err = updateCsiClusterConfig(s, clusterIDofCluster2, clusterIDofCluster2, &csiCluster2ConfigEntry)
 		assert.NoError(t, err)
 		cc, err = parseCsiClusterConfig(s)
 		assert.NoError(t, err)
@@ -321,11 +424,61 @@ func TestUpdateCsiClusterConfig(t *testing.T) {
 	})
 
 	t.Run("test multus cluster", func(t *testing.T) {
-		s, err = updateCsiClusterConfig("[]", "rook-ceph-1", &csiClusterConfigEntryMultus)
+		s, err = updateCsiClusterConfig("[]", "rook-ceph-1", "rook-ceph-1", &csiClusterConfigEntryMultus)
 		assert.NoError(t, err)
-		assert.Equal(t, `[{"clusterID":"rook-ceph-1","monitors":["1.2.3.4:5000"],"namespace":"rook-ceph-1","rbd":{"netNamespaceFilePath":"/var/run/netns/rook-ceph-1","radosNamespace":"rook-ceph-1"}}]`, s)
+		compareJSON(t, `[{"clusterID":"rook-ceph-1","monitors":["1.2.3.4:5000"],"rbd":{"netNamespaceFilePath":"/var/run/netns/rook-ceph-1","radosNamespace":"rook-ceph-1"},"namespace":"rook-ceph-1"}]`, s)
 	})
 
+	t.Run("test crush location labels are set", func(t *testing.T) {
+		s, err = updateCsiClusterConfig("[]", "rook-ceph-4", "rook-ceph-4", &csiClusterConfigEntry4)
+		assert.NoError(t, err)
+		compareJSON(t, `[{"clusterID":"rook-ceph-4","monitors":["10.1.1.1:5000"],"readAffinity": {"enabled": true, "crushLocationLabels":["kubernetes.io/hostname",
+		"topology.kubernetes.io/region","topology.kubernetes.io/zone","topology.rook.io/chassis","topology.rook.io/rack","topology.rook.io/row","topology.rook.io/pdu",
+		"topology.rook.io/pod","topology.rook.io/room","topology.rook.io/datacenter"]},"namespace":"rook-ceph-4"}]`, s)
+	})
+
+	t.Run("test empty namespace correction", func(t *testing.T) {
+		currentConfigFormatString := `[` +
+			`{"clusterID":"cluster-id-and-namespace","monitors":["172.30.100.1:3300"],"cephFS":{"netNamespaceFilePath":"","subvolumeGroup":"","radosNamespace":"","kernelMountOptions":"","fuseMountOptions":""},"rbd":{"netNamespaceFilePath":"","radosNamespace":"","mirrorDaemonCount":0},"nfs":{"netNamespaceFilePath":""},"readAffinity":{"enabled":false,"crushLocationLabels":null},"namespace":"%s"},` +
+			`{"clusterID":"5bb69c306a7d011c3e91c3cec112fb7a","monitors":["172.30.100.1:3300"],"cephFS":{"netNamespaceFilePath":"","subvolumeGroup":"csi","radosNamespace":"","kernelMountOptions":"","fuseMountOptions":""},"rbd":{"netNamespaceFilePath":"","radosNamespace":"","mirrorDaemonCount":0},"nfs":{"netNamespaceFilePath":""},"readAffinity":{"enabled":false,"crushLocationLabels":null},"namespace":"cluster-id-and-namespace"}` +
+			`]`
+		idAndNs := "cluster-id-and-namespace"
+
+		csiConfigEntry := &CSIClusterConfigEntry{
+			Namespace: idAndNs,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: []string{"172.30.100.1:3300"},
+			},
+		}
+		currentConfigWithoutNamespace := fmt.Sprintf(currentConfigFormatString, "")
+		out, err := updateCsiClusterConfig(currentConfigWithoutNamespace, idAndNs, idAndNs, csiConfigEntry)
+		assert.NoError(t, err)
+		expectedOutput := fmt.Sprintf(currentConfigFormatString, idAndNs)
+		assert.Equal(t, expectedOutput, out)
+	})
+
+	t.Run("test empty namespace correction and clear netNamespaceFilePath", func(t *testing.T) {
+		holderEnabled = false
+		currentConfigFormatString := `[` +
+			`{"clusterID":"cluster-id-and-namespace","monitors":["172.30.100.1:3300"],"cephFS":{"netNamespaceFilePath":"%s","subvolumeGroup":"","radosNamespace":"","kernelMountOptions":"","fuseMountOptions":""},"rbd":{"netNamespaceFilePath":"%s","radosNamespace":"","mirrorDaemonCount":0},"nfs":{"netNamespaceFilePath":""},"readAffinity":{"enabled":false,"crushLocationLabels":null},"namespace":"%s"},` +
+			`{"clusterID":"5bb69c306a7d011c3e91c3cec112fb7a","monitors":["172.30.100.1:3300"],"cephFS":{"netNamespaceFilePath":"","subvolumeGroup":"csi","radosNamespace":"","kernelMountOptions":"","fuseMountOptions":""},"rbd":{"netNamespaceFilePath":"","radosNamespace":"","mirrorDaemonCount":0},"nfs":{"netNamespaceFilePath":""},"readAffinity":{"enabled":false,"crushLocationLabels":null},"namespace":"cluster-id-and-namespace"}` +
+			`]`
+		cephFsNetNsFilePath := "/var/lib/kubelet/plugins/cluster-id-and-namespace.cephfs.csi.ceph.com/cluster-id-and-namespace.net.ns"
+		rbdNetNsFilePath := "/var/lib/kubelet/plugins/cluster-id-and-namespace.rbd.csi.ceph.com/cluster-id-and-namespace.net.ns"
+		idAndNs := "cluster-id-and-namespace"
+
+		csiConfigEntry := &CSIClusterConfigEntry{
+			Namespace: idAndNs,
+			ClusterInfo: cephcsi.ClusterInfo{
+				Monitors: []string{"172.30.100.1:3300"},
+			},
+		}
+		currentConfigWithoutNamespace := fmt.Sprintf(currentConfigFormatString, cephFsNetNsFilePath, rbdNetNsFilePath, "")
+		out, err := updateCsiClusterConfig(currentConfigWithoutNamespace, idAndNs, idAndNs, csiConfigEntry)
+		assert.NoError(t, err)
+		expectedOutput := fmt.Sprintf(currentConfigFormatString, "", "", idAndNs)
+		assert.Equal(t, expectedOutput, out)
+	})
 }
 
 func contains(src, dest []string) bool {
@@ -399,6 +552,8 @@ func TestUpdateCSIDriverOptions(t *testing.T) {
 		clusterKey       string
 		csiDriverOptions *cephv1.CSIDriverSpec
 	}
+	holderEnabled = true
+
 	tests := []struct {
 		name    string
 		args    args
@@ -408,21 +563,26 @@ func TestUpdateCSIDriverOptions(t *testing.T) {
 		{
 			name: "empty current config",
 			args: args{
-				clusterConfig:    []CsiClusterConfigEntry{},
+				clusterConfig:    []CSIClusterConfigEntry{},
 				clusterKey:       "rook-ceph",
 				csiDriverOptions: &cephv1.CSIDriverSpec{},
 			},
-			want:    []CsiClusterConfigEntry{},
+			want:    []CSIClusterConfigEntry{},
 			wantErr: false,
 		},
 		{
 			name: "single matching current config",
 			args: args{
-				clusterConfig: []CsiClusterConfigEntry{
+				clusterConfig: []CSIClusterConfigEntry{
 					{
-						ClusterID: "rook-ceph",
 						Namespace: "rook-ceph",
-						Monitors:  []string{"1.1.1.1"},
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "rook-ceph",
+							Monitors:  []string{"1.1.1.1"},
+							CephFS: cephcsi.CephFS{
+								NetNamespaceFilePath: "netnamespacefilepath",
+							},
+						},
 					},
 				},
 				clusterKey: "rook-ceph",
@@ -437,18 +597,21 @@ func TestUpdateCSIDriverOptions(t *testing.T) {
 					},
 				},
 			},
-			want: []CsiClusterConfigEntry{
+			want: []CSIClusterConfigEntry{
 				{
-					ClusterID: "rook-ceph",
 					Namespace: "rook-ceph",
-					Monitors:  []string{"1.1.1.1"},
-					ReadAffinity: &cephv1.ReadAffinitySpec{
-						Enabled:             true,
-						CrushLocationLabels: []string{"topology.rook.io/rack"},
-					},
-					CephFS: &CsiCephFSSpec{
-						KernelMountOptions: "rw,noatime",
-						FuseMountOptions:   "debug",
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "rook-ceph",
+						Monitors:  []string{"1.1.1.1"},
+						ReadAffinity: cephcsi.ReadAffinity{
+							Enabled:             true,
+							CrushLocationLabels: []string{"topology.rook.io/rack"},
+						},
+						CephFS: cephcsi.CephFS{
+							KernelMountOptions:   "rw,noatime",
+							FuseMountOptions:     "debug",
+							NetNamespaceFilePath: "netnamespacefilepath",
+						},
 					},
 				},
 			},
@@ -457,21 +620,27 @@ func TestUpdateCSIDriverOptions(t *testing.T) {
 		{
 			name: "multiple matching current config",
 			args: args{
-				clusterConfig: []CsiClusterConfigEntry{
+				clusterConfig: []CSIClusterConfigEntry{
 					{
-						ClusterID: "rook-ceph",
 						Namespace: "rook-ceph",
-						Monitors:  []string{"1.1.1.1"},
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "rook-ceph",
+							Monitors:  []string{"1.1.1.1"},
+						},
 					},
 					{
-						ClusterID: "rook-ceph-2",
 						Namespace: "rook-ceph",
-						Monitors:  []string{"1.1.1.1"},
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "rook-ceph-2",
+							Monitors:  []string{"1.1.1.1"},
+						},
 					},
 					{
-						ClusterID: "rook-ceph-3",
 						Namespace: "rook-ceph-1",
-						Monitors:  []string{"1.1.1.1"},
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "rook-ceph-3",
+							Monitors:  []string{"1.1.1.1"},
+						},
 					},
 				},
 				clusterKey: "rook-ceph",
@@ -486,37 +655,43 @@ func TestUpdateCSIDriverOptions(t *testing.T) {
 					},
 				},
 			},
-			want: []CsiClusterConfigEntry{
+			want: []CSIClusterConfigEntry{
 				{
-					ClusterID: "rook-ceph",
 					Namespace: "rook-ceph",
-					Monitors:  []string{"1.1.1.1"},
-					ReadAffinity: &cephv1.ReadAffinitySpec{
-						Enabled:             true,
-						CrushLocationLabels: []string{"topology.rook.io/rack"},
-					},
-					CephFS: &CsiCephFSSpec{
-						KernelMountOptions: "rw,noatime",
-						FuseMountOptions:   "debug",
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "rook-ceph",
+						Monitors:  []string{"1.1.1.1"},
+						ReadAffinity: cephcsi.ReadAffinity{
+							Enabled:             true,
+							CrushLocationLabels: []string{"topology.rook.io/rack"},
+						},
+						CephFS: cephcsi.CephFS{
+							KernelMountOptions: "rw,noatime",
+							FuseMountOptions:   "debug",
+						},
 					},
 				},
 				{
-					ClusterID: "rook-ceph-2",
 					Namespace: "rook-ceph",
-					Monitors:  []string{"1.1.1.1"},
-					ReadAffinity: &cephv1.ReadAffinitySpec{
-						Enabled:             true,
-						CrushLocationLabels: []string{"topology.rook.io/rack"},
-					},
-					CephFS: &CsiCephFSSpec{
-						KernelMountOptions: "rw,noatime",
-						FuseMountOptions:   "debug",
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "rook-ceph-2",
+						Monitors:  []string{"1.1.1.1"},
+						ReadAffinity: cephcsi.ReadAffinity{
+							Enabled:             true,
+							CrushLocationLabels: []string{"topology.rook.io/rack"},
+						},
+						CephFS: cephcsi.CephFS{
+							KernelMountOptions: "rw,noatime",
+							FuseMountOptions:   "debug",
+						},
 					},
 				},
 				{
-					ClusterID: "rook-ceph-3",
 					Namespace: "rook-ceph-1",
-					Monitors:  []string{"1.1.1.1"},
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "rook-ceph-3",
+						Monitors:  []string{"1.1.1.1"},
+					},
 				},
 			},
 			wantErr: false,
@@ -536,4 +711,355 @@ func TestUpdateCSIDriverOptions(t *testing.T) {
 			assert.Equal(t, expectedString, got)
 		})
 	}
+}
+
+func TestUpdateNetNamespaceFilePath(t *testing.T) {
+	type args struct {
+		clusterConfig csiClusterConfig
+		clusterKey    string
+		holderEnabled bool
+	}
+
+	tests := []struct {
+		name string
+		args args
+		want csiClusterConfig
+	}{
+		{
+			name: "empty",
+			args: args{
+				clusterKey:    "rook-ceph",
+				holderEnabled: false,
+				clusterConfig: []CSIClusterConfigEntry{},
+			},
+			want: []CSIClusterConfigEntry{},
+		},
+		{
+			name: "holder enabled",
+			args: args{
+				clusterKey:    "rook-ceph",
+				holderEnabled: true,
+				clusterConfig: []CSIClusterConfigEntry{
+					{
+						Namespace: "rook-ceph",
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "rook-ceph",
+							Monitors:  []string{"1.1.1.1"},
+							CephFS: cephcsi.CephFS{
+								NetNamespaceFilePath: "cephfs.net.ns",
+							},
+							RBD: cephcsi.RBD{
+								NetNamespaceFilePath: "rbd.net.ns",
+							},
+							NFS: cephcsi.NFS{
+								NetNamespaceFilePath: "nfs.net.ns",
+							},
+						},
+					},
+					{
+						Namespace: "rook-ceph",
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "cluster-1",
+							Monitors:  []string{"1.1.1.1"},
+							CephFS: cephcsi.CephFS{
+								SubvolumeGroup: "csi",
+							},
+						},
+					},
+				},
+			},
+			want: []CSIClusterConfigEntry{
+				{
+					Namespace: "rook-ceph",
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "rook-ceph",
+						Monitors:  []string{"1.1.1.1"},
+						CephFS: cephcsi.CephFS{
+							NetNamespaceFilePath: "cephfs.net.ns",
+						},
+						RBD: cephcsi.RBD{
+							NetNamespaceFilePath: "rbd.net.ns",
+						},
+						NFS: cephcsi.NFS{
+							NetNamespaceFilePath: "nfs.net.ns",
+						},
+					},
+				},
+				{
+					Namespace: "rook-ceph",
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "cluster-1",
+						Monitors:  []string{"1.1.1.1"},
+						CephFS: cephcsi.CephFS{
+							SubvolumeGroup:       "csi",
+							NetNamespaceFilePath: "cephfs.net.ns",
+						},
+						RBD: cephcsi.RBD{
+							NetNamespaceFilePath: "rbd.net.ns",
+						},
+						NFS: cephcsi.NFS{
+							NetNamespaceFilePath: "nfs.net.ns",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "holder disabled",
+			args: args{
+				clusterKey:    "rook-ceph",
+				holderEnabled: false,
+				clusterConfig: []CSIClusterConfigEntry{
+					{
+						Namespace: "rook-ceph",
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "rook-ceph",
+							Monitors:  []string{"1.1.1.1"},
+							CephFS: cephcsi.CephFS{
+								NetNamespaceFilePath: "cephfs.net.ns",
+							},
+							RBD: cephcsi.RBD{
+								NetNamespaceFilePath: "rbd.net.ns",
+							},
+							NFS: cephcsi.NFS{
+								NetNamespaceFilePath: "nfs.net.ns",
+							},
+						},
+					},
+					{
+						Namespace: "rook-ceph",
+						ClusterInfo: cephcsi.ClusterInfo{
+							ClusterID: "cluster-1",
+							Monitors:  []string{"1.1.1.1"},
+							RBD: cephcsi.RBD{
+								RadosNamespace: "group-1",
+							},
+						},
+					},
+				},
+			},
+			want: []CSIClusterConfigEntry{
+				{
+					Namespace: "rook-ceph",
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "rook-ceph",
+						Monitors:  []string{"1.1.1.1"},
+						CephFS: cephcsi.CephFS{
+							NetNamespaceFilePath: "",
+						},
+						RBD: cephcsi.RBD{
+							NetNamespaceFilePath: "",
+						},
+						NFS: cephcsi.NFS{
+							NetNamespaceFilePath: "",
+						},
+					},
+				},
+				{
+					Namespace: "rook-ceph",
+					ClusterInfo: cephcsi.ClusterInfo{
+						ClusterID: "cluster-1",
+						Monitors:  []string{"1.1.1.1"},
+						CephFS: cephcsi.CephFS{
+							NetNamespaceFilePath: "",
+						},
+						RBD: cephcsi.RBD{
+							NetNamespaceFilePath: "",
+							RadosNamespace:       "group-1",
+						},
+						NFS: cephcsi.NFS{
+							NetNamespaceFilePath: "",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cephfsNsFilePath := "cephfs.net.ns"
+	rbdNsFilePath := "rbd.net.ns"
+	nfsNsFilePath := "nfs.net.ns"
+
+	csiConfigMap := csiClusterConfig{
+		{
+			Namespace: "rook-ceph",
+			ClusterInfo: cephcsi.ClusterInfo{
+				ClusterID: "rook-ceph",
+				CephFS: cephcsi.CephFS{
+					NetNamespaceFilePath: cephfsNsFilePath,
+				},
+				RBD: cephcsi.RBD{
+					NetNamespaceFilePath: rbdNsFilePath,
+				},
+				NFS: cephcsi.NFS{
+					NetNamespaceFilePath: nfsNsFilePath,
+				},
+			},
+		},
+		{
+			Namespace: "rook-ceph",
+			ClusterInfo: cephcsi.ClusterInfo{
+				ClusterID: "svg",
+			},
+		},
+		{
+			Namespace: "default",
+			ClusterInfo: cephcsi.ClusterInfo{
+				ClusterID: "rook-ceph",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			holderEnabled = tt.args.holderEnabled
+			updateNetNamespaceFilePath("rook-ceph", tt.args.clusterConfig)
+			assert.True(t, reflect.DeepEqual(tt.args.clusterConfig, tt.want))
+		})
+	}
+
+	t.Run("Holder enabled and disabled later", func(t *testing.T) {
+		holderEnabled = true
+		updateNetNamespaceFilePath("rook-ceph", csiConfigMap)
+		for _, c := range csiConfigMap {
+			if c.Namespace == "rook-ceph" {
+				assert.Equal(t, cephfsNsFilePath, c.CephFS.NetNamespaceFilePath)
+				assert.Equal(t, rbdNsFilePath, c.RBD.NetNamespaceFilePath)
+				assert.Equal(t, nfsNsFilePath, c.NFS.NetNamespaceFilePath)
+			}
+		}
+
+		holderEnabled = false
+		updateNetNamespaceFilePath("rook-ceph", csiConfigMap)
+		for _, c := range csiConfigMap {
+			if c.Namespace == "rook-ceph" {
+				assert.Equal(t, "", c.CephFS.NetNamespaceFilePath)
+				assert.Equal(t, "", c.RBD.NetNamespaceFilePath)
+				assert.Equal(t, "", c.NFS.NetNamespaceFilePath)
+
+			}
+		}
+	})
+}
+
+func Test_updateCsiConfigMapOwnerRefs(t *testing.T) {
+	ctx := context.TODO()
+	ns := "test-ns"
+	ownerController := true
+	blockOwnerDel := true
+	opDeployRef := metav1.OwnerReference{
+		APIVersion:         "v1",
+		Kind:               "Deployment",
+		Name:               "rook-ceph-operator",
+		UID:                "e55604f2-710c-4353-9a3e-9d23ea2d6eb9", // random uuid
+		Controller:         &ownerController,
+		BlockOwnerDeletion: &blockOwnerDel,
+	}
+	expectedOwnerInfo := k8sutil.NewOwnerInfoWithOwnerRef(&opDeployRef, ns)
+
+	minimalCsiConfigMap := func() *corev1.ConfigMap {
+		return &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            ConfigName,
+				Namespace:       ns,
+				OwnerReferences: []metav1.OwnerReference{},
+			},
+		}
+	}
+
+	t.Run("no configmap", func(t *testing.T) {
+		clientset := test.New(t, 1)
+		err := updateCsiConfigMapOwnerRefs(ctx, ns, clientset, expectedOwnerInfo)
+		assert.ErrorContains(t, err, "failed to fetch csi config map")
+		assert.ErrorContains(t, err, "which already exists")
+	})
+
+	assertOwner := func(t *testing.T, clientset kubernetes.Interface) {
+		t.Helper()
+
+		cm, err := clientset.CoreV1().ConfigMaps(ns).Get(ctx, ConfigName, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Len(t, cm.GetOwnerReferences(), 1)
+		cmOwner := cm.GetOwnerReferences()[0]
+		assert.Equal(t, "v1", cmOwner.APIVersion)
+		assert.Equal(t, "Deployment", cmOwner.Kind)
+		assert.Equal(t, "rook-ceph-operator", cmOwner.Name)
+		assert.Equal(t, "e55604f2-710c-4353-9a3e-9d23ea2d6eb9", string(cmOwner.UID))
+		assert.True(t, *cmOwner.Controller)
+		assert.True(t, *cmOwner.BlockOwnerDeletion)
+	}
+
+	t.Run("no existing owner ref", func(t *testing.T) {
+		clientset := test.New(t, 1)
+		cm := minimalCsiConfigMap()
+		_, err := clientset.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = updateCsiConfigMapOwnerRefs(ctx, ns, clientset, expectedOwnerInfo)
+		assert.NoError(t, err)
+		assertOwner(t, clientset)
+	})
+
+	t.Run("correct existing owner ref", func(t *testing.T) {
+		clientset := test.New(t, 1)
+		cm := minimalCsiConfigMap()
+		cm.OwnerReferences = []metav1.OwnerReference{
+			*opDeployRef.DeepCopy(), // correct ref
+		}
+		_, err := clientset.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = updateCsiConfigMapOwnerRefs(ctx, ns, clientset, expectedOwnerInfo)
+		assert.NoError(t, err)
+		assertOwner(t, clientset)
+	})
+
+	t.Run("single incorrect existing owner ref", func(t *testing.T) {
+		clientset := test.New(t, 1)
+		cm := minimalCsiConfigMap()
+
+		ownerController := true
+		blockOwnerDel := true
+		cm.OwnerReferences = []metav1.OwnerReference{
+			{
+				APIVersion:         "ceph.rook.io/v1",
+				Kind:               "CephCluster",
+				Name:               "my-cluster",
+				UID:                "a77777a7-777a-7777-7a7a-7a77aa7a7aa7", // random uuid
+				Controller:         &ownerController,
+				BlockOwnerDeletion: &blockOwnerDel,
+			},
+		}
+		_, err := clientset.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = updateCsiConfigMapOwnerRefs(ctx, ns, clientset, expectedOwnerInfo)
+		assert.NoError(t, err)
+		assertOwner(t, clientset)
+	})
+
+	t.Run("multiple existing owner refs, one correct", func(t *testing.T) {
+		clientset := test.New(t, 1)
+		cm := minimalCsiConfigMap()
+
+		ownerController := true
+		blockOwnerDel := true
+		cm.OwnerReferences = []metav1.OwnerReference{
+			*opDeployRef.DeepCopy(), // correct ref
+			{
+				APIVersion:         "ceph.rook.io/v1",
+				Kind:               "CephCluster",
+				Name:               "my-cluster",
+				UID:                "a77777a7-777a-7777-7a7a-7a77aa7a7aa7", // random uuid
+				Controller:         &ownerController,
+				BlockOwnerDeletion: &blockOwnerDel,
+			},
+		}
+		_, err := clientset.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = updateCsiConfigMapOwnerRefs(ctx, ns, clientset, expectedOwnerInfo)
+		assert.NoError(t, err)
+		assertOwner(t, clientset)
+	})
 }

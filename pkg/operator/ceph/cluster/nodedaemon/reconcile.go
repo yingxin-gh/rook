@@ -59,10 +59,6 @@ var (
 	waitForRequeueIfSecretNotCreated = reconcile.Result{Requeue: true, RequeueAfter: 30 * time.Second}
 )
 
-const (
-	MinVersionForCronV1 = "1.21.0"
-)
-
 // ReconcileNode reconciles ReplicaSets
 type ReconcileNode struct {
 	// client can be used to retrieve objects from the APIServer.
@@ -85,12 +81,12 @@ func (r *ReconcileNode) Reconcile(context context.Context, request reconcile.Req
 	return result, err
 }
 
-func (r *ReconcileNode) cleanupExporterResources(clusterNamespace string, ns string, nodeName string) (reconcile.Result, error) {
+func (r *ReconcileNode) cleanupExporterResources(ns string, nodeName string) (reconcile.Result, error) {
 	err := k8sutil.DeleteServiceMonitor(r.context, r.opManagerContext, ns, cephExporterAppName)
 	if err != nil {
 		logger.Debugf("failed to delete service monitor for ceph exporter in namespace %q on node %q. %v", ns, nodeName, err)
 	}
-	err = k8sutil.DeleteService(r.opManagerContext, r.context.Clientset, r.opConfig.OperatorNamespace, cephExporterAppName)
+	err = k8sutil.DeleteService(r.opManagerContext, r.context.Clientset, ns, cephExporterAppName)
 	if err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "failed to delete ceph exporter metrics service in namespace %q on node %q", ns, nodeName)
 	}
@@ -207,10 +203,6 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 			if err != nil {
 				return reconcile.Result{}, errors.Wrapf(err, "failed to list and delete deployments in namespace %q on node %q", namespace, request.Name)
 			}
-			result, err := r.cleanupExporterResources(cephCluster.Namespace, namespace, request.Name)
-			if err != nil {
-				return result, errors.Wrapf(err, "failed to cleanup exporter resources in namespace %q on node %q", namespace, request.Name)
-			}
 		}
 		// Cleanup exporter if the ceph version isn't supported
 		if !cephVersion.IsAtLeast(MinVersionForCephExporter) {
@@ -219,7 +211,7 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 					if err := r.listDeploymentAndDelete(cephExporterAppName, request.Name, namespace); err != nil {
 						return reconcile.Result{}, errors.Wrap(err, "failed to delete ceph-exporter")
 					}
-					result, err := r.cleanupExporterResources(cephCluster.Namespace, namespace, request.Name)
+					result, err := r.cleanupExporterResources(namespace, request.Name)
 					if err != nil {
 						return result, errors.Wrapf(err, "failed to cleanup exporter resources in namespace %q on node %q", namespace, request.Name)
 					}
@@ -227,7 +219,7 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 			}
 		}
 
-		if err := r.reconcileCrashPruner(namespace, cephCluster, cephVersion); err != nil {
+		if err := r.reconcileCrashPruner(namespace, cephCluster); err != nil {
 			return reconcile.Result{}, err
 		}
 	}

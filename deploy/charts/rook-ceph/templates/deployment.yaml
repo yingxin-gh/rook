@@ -9,6 +9,9 @@ metadata:
     {{- include "library.rook-ceph.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.scaleDownOperator | ternary 0 1 }}
+{{- if .Values.revisionHistoryLimit }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+{{- end }}
   selector:
     matchLabels:
       app: rook-ceph-operator
@@ -27,6 +30,14 @@ spec:
 {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName }}
 {{- end }}
+      tolerations:
+        - effect: NoExecute
+          key: node.kubernetes.io/unreachable
+          operator: Exists
+          tolerationSeconds: 5
+{{- if .Values.tolerations }}
+{{ toYaml .Values.tolerations | indent 8 }}
+{{- end }}
       containers:
       - name: rook-ceph-operator
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -38,12 +49,6 @@ spec:
           name: rook-config
         - mountPath: /etc/ceph
           name: default-config-dir
-        - mountPath: /etc/webhook
-          name: webhook-cert
-        ports:
-          - containerPort: 9443
-            name: https-webhook
-            protocol: TCP
         env:
         - name: ROOK_CURRENT_NAMESPACE_ONLY
           value: {{ .Values.currentNamespaceOnly | quote }}
@@ -66,7 +71,7 @@ spec:
 {{- end }}
 {{- if .Values.discover.nodeAffinity }}
         - name: DISCOVER_AGENT_NODE_AFFINITY
-          value: {{ .Values.discover.nodeAffinity }}
+          value: {{ toYaml .Values.discover.nodeAffinity | quote }}
 {{- end }}
 {{- if .Values.discover.podLabels }}
         - name: DISCOVER_AGENT_POD_LABELS
@@ -111,10 +116,6 @@ spec:
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}
 {{- end }}
-{{- if .Values.tolerations }}
-      tolerations:
-{{ toYaml .Values.tolerations | indent 8 }}
-{{- end }}
 {{- if .Values.rbacEnable }}
       serviceAccountName: rook-ceph-system
 {{- end }}
@@ -122,6 +123,4 @@ spec:
       - name: rook-config
         emptyDir: {}
       - name: default-config-dir
-        emptyDir: {}
-      - name: webhook-cert
         emptyDir: {}

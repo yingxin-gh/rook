@@ -21,13 +21,14 @@
         "external",
         "file",
         "helm",
-	"k8sutil",
+        "k8sutil",
         "manifest",
         "mds",
         "mgr",
         "mon",
         "monitoring",
         "multus",
+        "network",
         "nfs",
         "object",
         "operator",
@@ -39,8 +40,7 @@
         "subvolumegroup",
         "namespace",
         "test",
-        "tests",
-        "webhook"
+        "tests"
       ]
     ],
     "body-leading-blank": [

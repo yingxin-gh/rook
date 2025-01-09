@@ -49,6 +49,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	cephcsi "github.com/ceph/ceph-csi/api/deploy/kubernetes"
 )
 
 const (
@@ -115,6 +117,8 @@ type Cluster struct {
 	ownerInfo          *k8sutil.OwnerInfo
 	isUpgrade          bool
 	arbiterMon         string
+	// list of mons to be failed over
+	monsToFailover sets.Set[string]
 }
 
 // monConfig for a single monitor
@@ -162,6 +166,7 @@ func New(ctx context.Context, clusterdContext *clusterd.Context, namespace strin
 		ClusterInfo: &cephclient.ClusterInfo{
 			Context: ctx,
 		},
+		monsToFailover: sets.New[string](),
 	}
 }
 
@@ -355,12 +360,6 @@ func (c *Cluster) ConfigureArbiter() error {
 	if err != nil {
 		logger.Warningf("attempting to enable arbiter after failed to detect if already enabled. %v", err)
 	} else if monDump.StretchMode {
-		// only support arbiter failover if at least v16.2.7
-		if !c.ClusterInfo.CephVersion.IsAtLeast(arbiterFailoverSupportedCephVersion) {
-			logger.Info("stretch mode is already enabled")
-			return nil
-		}
-
 		if monDump.TiebreakerMon == c.arbiterMon {
 			logger.Infof("stretch mode is already enabled with tiebreaker %q", c.arbiterMon)
 			return nil
@@ -974,7 +973,7 @@ func (c *Cluster) monVolumeClaimTemplate(mon *monConfig) *v1.PersistentVolumeCla
 			if zone.Name == mon.Zone {
 				if zone.VolumeClaimTemplate != nil {
 					// Found an override for the volume claim template in the zone
-					return zone.VolumeClaimTemplate
+					return zone.VolumeClaimTemplate.ToPVC()
 				}
 				break
 			}
@@ -982,7 +981,7 @@ func (c *Cluster) monVolumeClaimTemplate(mon *monConfig) *v1.PersistentVolumeCla
 	}
 
 	// Return the default template since one wasn't found in the zone or zone was not specified
-	return c.spec.Mon.VolumeClaimTemplate
+	return c.spec.Mon.VolumeClaimTemplate.ToPVC()
 }
 
 func (c *Cluster) startDeployments(mons []*monConfig, requireAllInQuorum bool) error {
@@ -1061,7 +1060,48 @@ func (c *Cluster) startDeployments(mons []*monConfig, requireAllInQuorum bool) e
 			requireAllInQuorum = true
 		}
 	}
-	return c.waitForMonsToJoin(mons, requireAllInQuorum)
+	err = c.waitForMonsToJoin(mons, requireAllInQuorum)
+
+	// Check for the rare case of an extra mon deployment that needs to be cleaned up
+	c.checkForExtraMonResources(mons, deployments.Items)
+	return err
+}
+
+func (c *Cluster) checkForExtraMonResources(mons []*monConfig, deployments []apps.Deployment) string {
+	// If there are fewer mon deployments than the desired count, no need to remove an extra.
+	if len(deployments) <= c.spec.Mon.Count || len(deployments) <= len(mons) {
+		logger.Debug("no extra mon deployments to remove")
+		return ""
+	}
+	// If there are fewer mons in the list than expected, either new mons are being created for
+	// a new cluster, or a mon failover is in progress and the list of mons only
+	// includes the single mon that was just started
+	if len(mons) < c.spec.Mon.Count {
+		logger.Debug("new cluster or mon failover in progress, not checking for extra mon deployments")
+		return ""
+	}
+
+	// If there are more deployments than expected mons from the ceph quorum,
+	// find the extra mon deployment and clean it up.
+	logger.Infof("there is an extra mon deployment that is not needed and not in quorum")
+	for _, deploy := range deployments {
+		monName := deploy.Labels[controller.DaemonIDLabel]
+		found := false
+		// Search for the mon in the list of mons expected in quorum
+		for _, monDaemon := range mons {
+			if monName == monDaemon.DaemonName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			logger.Infof("deleting extra mon deployment %q", deploy.Name)
+			c.removeMonResources(monName)
+			return monName
+		}
+	}
+
+	return ""
 }
 
 func (c *Cluster) waitForMonsToJoin(mons []*monConfig, requireAllInQuorum bool) error {
@@ -1101,8 +1141,27 @@ func (c *Cluster) saveMonConfig() error {
 	}
 
 	monEndpoints := csi.MonEndpoints(c.ClusterInfo.Monitors, c.spec.RequireMsgr2())
-	if err := csi.SaveClusterConfig(c.context.Clientset, c.Namespace, c.ClusterInfo, &csi.CsiClusterConfigEntry{Namespace: c.ClusterInfo.Namespace, Monitors: monEndpoints}); err != nil {
+	csiConfigEntry := &csi.CSIClusterConfigEntry{
+		Namespace: c.ClusterInfo.Namespace,
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: monEndpoints,
+		},
+	}
+
+	clusterId := c.Namespace // cluster id is same as cluster namespace for CephClusters
+	if err := csi.SaveClusterConfig(c.context.Clientset, clusterId, c.Namespace, c.ClusterInfo, csiConfigEntry); err != nil {
 		return errors.Wrap(err, "failed to update csi cluster config")
+	}
+
+	if csi.EnableCSIOperator() && len(c.ClusterInfo.Monitors) > 0 {
+		err := csi.CreateUpdateCephConnection(c.context.Client, c.ClusterInfo, c.spec)
+		if err != nil {
+			return errors.Wrap(err, "failed to create/update cephConnection")
+		}
+		err = csi.CreateDefaultClientProfile(c.context.Client, c.ClusterInfo, c.ClusterInfo.NamespacedName())
+		if err != nil {
+			return errors.Wrap(err, "failed to create/update default client profile")
+		}
 	}
 
 	return nil
@@ -1230,11 +1289,6 @@ var updateDeploymentAndWait = UpdateCephDeploymentAndWait
 
 func (c *Cluster) updateMon(m *monConfig, d *apps.Deployment) error {
 
-	if c.HasMonPathChanged(m.DaemonName) {
-		logger.Infof("path has changed for mon %q. Skip updating mon deployment %q in order to failover the mon", m.DaemonName, d.Name)
-		return nil
-	}
-
 	// Expand mon PVC if storage request for mon has increased in cephcluster crd
 	if c.monVolumeClaimTemplate(m) != nil {
 		desiredPvc, err := c.makeDeploymentPVC(m, false)
@@ -1339,6 +1393,18 @@ func (c *Cluster) startMon(m *monConfig, schedule *controller.MonScheduleInfo) e
 
 	p.ApplyToPodSpec(&d.Spec.Template.Spec)
 	if deploymentExists {
+		// skip update if mon path has changed
+		if hasMonPathChanged(existingDeployment, c.spec.Mon.VolumeClaimTemplate.ToPVC()) {
+			c.monsToFailover.Insert(m.DaemonName)
+			return nil
+		}
+
+		// skip update if mon fail over is required due to change in hostnetwork settings
+		if isMonIPUpdateRequiredForHostNetwork(m.DaemonName, m.UseHostNetwork, &c.spec.Network) {
+			c.monsToFailover.Insert(m.DaemonName)
+			return nil
+		}
+
 		// the existing deployment may have a node selector. if the cluster
 		// isn't using host networking and the deployment is using pvc storage,
 		// then the node selector can be removed. this may happen after
@@ -1402,6 +1468,31 @@ func (c *Cluster) startMon(m *monConfig, schedule *controller.MonScheduleInfo) e
 	}
 
 	return nil
+}
+
+func isMonIPUpdateRequiredForHostNetwork(mon string, isMonUsingHostNetwork bool, network *cephv1.NetworkSpec) bool {
+	isHostNetworkEnabledInSpec := network.IsHost()
+	if isHostNetworkEnabledInSpec && !isMonUsingHostNetwork {
+		logger.Infof("host network is enabled for the cluster but mon %q is not running on host IP address", mon)
+		return true
+	} else if !isHostNetworkEnabledInSpec && isMonUsingHostNetwork {
+		logger.Infof("host network is disabled for the cluster but mon %q is still running on host IP address", mon)
+		return true
+	}
+
+	return false
+}
+
+func hasMonPathChanged(d *apps.Deployment, claim *v1.PersistentVolumeClaim) bool {
+	if d.Labels["pvc_name"] == "" && claim != nil {
+		logger.Infof("skipping update for mon %q where path has changed from hostPath to pvc", d.Name)
+		return true
+	} else if d.Labels["pvc_name"] != "" && claim == nil {
+		logger.Infof("skipping update for mon %q where path has changed from pvc to hostPath", d.Name)
+		return true
+	}
+
+	return false
 }
 
 func waitForQuorumWithMons(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo, mons []string, sleepTime int, requireAllInQuorum bool) error {

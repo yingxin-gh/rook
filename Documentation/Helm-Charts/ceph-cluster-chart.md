@@ -69,10 +69,12 @@ The following table lists the configurable parameters of the rook-operator chart
 | `cephObjectStores` | A list of CephObjectStore configurations to deploy | See [below](#ceph-object-stores) |
 | `clusterName` | The metadata.name of the CephCluster CR | The same as the namespace |
 | `configOverride` | Cluster ceph.conf override | `nil` |
+| `csiDriverNamePrefix` | CSI driver name prefix for cephfs, rbd and nfs. | `namespace name where rook-ceph operator is deployed` |
 | `ingress.dashboard` | Enable an ingress for the ceph-dashboard | `{}` |
 | `kubeVersion` | Optional override of the target kubernetes version | `nil` |
 | `monitoring.createPrometheusRules` | Whether to create the Prometheus rules for Ceph alerts | `false` |
 | `monitoring.enabled` | Enable Prometheus integration, will also create necessary RBAC rules to allow Operator to create ServiceMonitors. Monitoring requires Prometheus to be pre-installed | `false` |
+| `monitoring.metricsDisabled` | Whether to disable the metrics reported by Ceph. If false, the prometheus mgr module and Ceph exporter are enabled | `false` |
 | `monitoring.prometheusRule.annotations` | Annotations applied to PrometheusRule | `{}` |
 | `monitoring.prometheusRule.labels` | Labels applied to PrometheusRule | `{}` |
 | `monitoring.rulesNamespaceOverride` | The namespace in which to create the prometheus rules, if different from the rook cluster namespace. If you have multiple rook-ceph clusters in the same k8s cluster, choose the same namespace (ideally, namespace with prometheus deployed) to set rulesNamespaceOverride for all the clusters. Otherwise, you will get duplicate alerts with multiple alert definitions. | `nil` |
@@ -83,7 +85,7 @@ The following table lists the configurable parameters of the rook-operator chart
 | `toolbox.enabled` | Enable Ceph debugging pod deployment. See [toolbox](../Troubleshooting/ceph-toolbox.md) | `false` |
 | `toolbox.image` | Toolbox image, defaults to the image used by the Ceph cluster | `nil` |
 | `toolbox.priorityClassName` | Set the priority class for the toolbox if desired | `nil` |
-| `toolbox.resources` | Toolbox resources | `{"limits":{"cpu":"500m","memory":"1Gi"},"requests":{"cpu":"100m","memory":"128Mi"}}` |
+| `toolbox.resources` | Toolbox resources | `{"limits":{"memory":"1Gi"},"requests":{"cpu":"100m","memory":"128Mi"}}` |
 | `toolbox.tolerations` | Toolbox tolerations | `[]` |
 
 ### **Ceph Cluster Spec**
@@ -108,6 +110,8 @@ The `cephBlockPools` array in the values file will define a list of CephBlockPoo
 | `storageClass.enabled` | Whether a storage class is deployed alongside the CephBlockPool | `true` |
 | `storageClass.isDefault` | Whether the storage class will be the default storage class for PVCs. See [PersistentVolumeClaim documentation](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#persistentvolumeclaims) for details. | `true` |
 | `storageClass.name` | The name of the storage class | `ceph-block` |
+| `storageClass.annotations` | Additional storage class annotations | `{}` |
+| `storageClass.labels` | Additional storage class labels | `{}` |
 | `storageClass.parameters` | See [Block Storage](../Storage-Configuration/Block-Storage-RBD/block-storage.md) documentation or the helm values.yaml for suitable values | see values.yaml |
 | `storageClass.reclaimPolicy` | The default [Reclaim Policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy) to apply to PVCs created with this storage class. | `Delete` |
 | `storageClass.allowVolumeExpansion` | Whether [volume expansion](https://kubernetes.io/docs/concepts/storage/storage-classes/#allow-volume-expansion) is allowed by default. | `true` |
@@ -124,6 +128,8 @@ The `cephFileSystems` array in the values file will define a list of CephFileSys
 | `spec` | The CephFileSystem spec, see the [CephFilesystem CRD](../CRDs/Shared-Filesystem/ceph-filesystem-crd.md) documentation. | see values.yaml |
 | `storageClass.enabled` | Whether a storage class is deployed alongside the CephFileSystem | `true` |
 | `storageClass.name` | The name of the storage class | `ceph-filesystem` |
+| `storageClass.annotations` | Additional storage class annotations | `{}` |
+| `storageClass.labels` | Additional storage class labels | `{}` |
 | `storageClass.pool` | The name of [Data Pool](../CRDs/Shared-Filesystem/ceph-filesystem-crd.md#pools), without the filesystem name prefix | `data0` |
 | `storageClass.parameters` | See [Shared Filesystem](../Storage-Configuration/Shared-Filesystem-CephFS/filesystem-storage.md) documentation or the helm values.yaml for suitable values | see values.yaml |
 | `storageClass.reclaimPolicy` | The default [Reclaim Policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy) to apply to PVCs created with this storage class. | `Delete` |
@@ -139,6 +145,8 @@ The `cephObjectStores` array in the values file will define a list of CephObject
 | `spec` | The CephObjectStore spec, see the [CephObjectStore CRD](../CRDs/Object-Storage/ceph-object-store-crd.md) documentation. | see values.yaml |
 | `storageClass.enabled` | Whether a storage class is deployed alongside the CephObjectStore | `true` |
 | `storageClass.name` | The name of the storage class | `ceph-bucket` |
+| `storageClass.annotations` | Additional storage class annotations | `{}` |
+| `storageClass.labels` | Additional storage class labels | `{}` |
 | `storageClass.parameters` | See [Object Store storage class](../Storage-Configuration/Object-Storage-RGW/ceph-object-bucket-claim.md) documentation or the helm values.yaml for suitable values | see values.yaml |
 | `storageClass.reclaimPolicy` | The default [Reclaim Policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy) to apply to PVCs created with this storage class. | `Delete` |
 | `ingress.enabled` | Enable an ingress for the object store | `false` |

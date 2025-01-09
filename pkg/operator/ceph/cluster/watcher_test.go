@@ -20,10 +20,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/coreos/pkg/capnslog"
-	addonsv1alpha1 "github.com/csi-addons/kubernetes-csi-addons/apis/csiaddons/v1alpha1"
+	addonsv1alpha1 "github.com/csi-addons/kubernetes-csi-addons/api/csiaddons/v1alpha1"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
@@ -46,7 +47,7 @@ import (
 func getFakeClient(obj ...runtime.Object) client.Client {
 	// Register operator types with the runtime scheme.
 	scheme := scheme.Scheme
-	scheme.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &addonsv1alpha1.NetworkFence{})
+	scheme.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &addonsv1alpha1.NetworkFence{}, &addonsv1alpha1.NetworkFenceList{})
 	client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(obj...).Build()
 	return client
 }
@@ -95,6 +96,7 @@ func TestCheckStorageForNode(t *testing.T) {
 
 func TestOnK8sNode(t *testing.T) {
 	ns := "rook-ceph"
+	opns := "operator"
 	ctx := context.TODO()
 	cephCluster := fakeCluster(ns)
 	objects := []runtime.Object{
@@ -148,24 +150,25 @@ func TestOnK8sNode(t *testing.T) {
 	cephCluster.Status.Phase = k8sutil.ReadyStatus
 	client = getFakeClient(objects...)
 	clientCluster.client = client
-	b := clientCluster.onK8sNode(ctx, node)
+	b := clientCluster.onK8sNode(ctx, node, opns)
 	assert.True(t, b)
 
 	// node will not reconcile
-	b = clientCluster.onK8sNode(ctx, node)
+	b = clientCluster.onK8sNode(ctx, node, opns)
 	assert.False(t, b)
 }
 
 func TestHandleNodeFailure(t *testing.T) {
-	ns := "rook-ceph"
+	clusterns := "rook-ceph"
+	opns := "operator"
 	ctx := context.TODO()
-	cephCluster := fakeCluster(ns)
+	cephCluster := fakeCluster(clusterns)
 	objects := []runtime.Object{
 		cephCluster,
 	}
 	executor := &exectest.MockExecutor{}
 	client := getFakeClient(objects...)
-	c := newClientCluster(client, ns, &clusterd.Context{
+	c := newClientCluster(client, clusterns, &clusterd.Context{
 		Executor:            executor,
 		Clientset:           k8sFake.NewSimpleClientset(),
 		ApiExtensionsClient: apifake.NewSimpleClientset(),
@@ -175,9 +178,13 @@ func TestHandleNodeFailure(t *testing.T) {
 		switch {
 		case command == "rbd" && args[0] == "status":
 			return `{"watchers":[{"address":"192.168.39.137:0/3762982934","client":4307,"cookie":18446462598732840961}]}`, nil
+		case command == "ceph" && args[0] == "status":
+			return `{"entity":[{"addr": [{"addr": "10.244.0.12:0", "nonce":3247243972}]}], "client_metadata":{"root":"/"}}`, nil
+		case command == "ceph" && args[0] == "tell":
+			return `[{"entity":{"addr":{"addr":"10.244.0.12:0","nonce":3247243972}}, "client_metadata":{"root":"/volumes/csi/csi-vol-58469d41-f6c0-4720-b23a-0a0826b842ca","hostname":"fakenode"}}]`, nil
 
 		}
-		return "", errors.Errorf("unexpected rbd command %q", args)
+		return "", errors.Errorf("unexpected rbd/ceph command %q", args)
 	}
 
 	node := &corev1.Node{
@@ -200,24 +207,25 @@ func TestHandleNodeFailure(t *testing.T) {
 				},
 			},
 			VolumesInUse: []corev1.UniqueVolumeName{
-				"kubernetes.io/csi/rook-ceph.rbd.csi.ceph.com^0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002",
+				"kubernetes.io/csi/operator.rbd.csi.ceph.com^0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002",
+				"kubernetes.io/csi/operator.cephfs.csi.ceph.com^0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4001",
 			},
 		},
 	}
 
-	pv := &corev1.PersistentVolume{
+	rbdPV := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pvc-58469d41-f6c0-4720-b23a-0a0826b841ca",
 			Annotations: map[string]string{
-				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.rbd.csi.ceph.com", ns),
+				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.rbd.csi.ceph.com", opns),
 				"volume.kubernetes.io/provisioner-deletion-secret-name":      "rook-csi-rbd-provisioner",
-				"volume.kubernetes.io/provisioner-deletion-secret-namespace": ns,
+				"volume.kubernetes.io/provisioner-deletion-secret-namespace": clusterns,
 			},
 		},
 		Spec: corev1.PersistentVolumeSpec{
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
-					Driver:       fmt.Sprintf("%s.rbd.csi.ceph.com", ns),
+					Driver:       fmt.Sprintf("%s.rbd.csi.ceph.com", opns),
 					VolumeHandle: "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002",
 					VolumeAttributes: map[string]string{
 						"pool":      "replicapool",
@@ -228,21 +236,67 @@ func TestHandleNodeFailure(t *testing.T) {
 		},
 	}
 
-	staticPV := &corev1.PersistentVolume{
+	cephfsPV := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "pvc-58469d41-f6c0-4720-b23a-0a0826b841cb",
+			Name: "pvc-58469d41-f6c0-4720-b23a-0a0826b842ca",
 			Annotations: map[string]string{
-				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.rbd.csi.ceph.com", ns),
-				"volume.kubernetes.io/provisioner-deletion-secret-name":      "rook-csi-rbd-provisioner",
-				"volume.kubernetes.io/provisioner-deletion-secret-namespace": ns,
+				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.cephfs.csi.ceph.com", opns),
+				"volume.kubernetes.io/provisioner-deletion-secret-name":      "rook-csi-cephfs-provisioner",
+				"volume.kubernetes.io/provisioner-deletion-secret-namespace": clusterns,
 			},
 		},
 		Spec: corev1.PersistentVolumeSpec{
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
-					Driver:           fmt.Sprintf("%s.rbd.csi.ceph.com", ns),
+					Driver:       fmt.Sprintf("%s.cephfs.csi.ceph.com", opns),
+					VolumeHandle: "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4001",
+					VolumeAttributes: map[string]string{
+						"fsName":        "myfs",
+						"subvolumePath": "/volumes/csi/csi-vol-58469d41-f6c0-4720-b23a-0a0826b842ca",
+						"subvolumeName": "csi-vol-58469d41-f6c0-4720-b23a-0a0826b842ca",
+					},
+				},
+			},
+		},
+	}
+
+	staticRbdPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-58469d41-f6c0-4720-b23a-0a0826b841cb",
+			Annotations: map[string]string{
+				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.rbd.csi.ceph.com", opns),
+				"volume.kubernetes.io/provisioner-deletion-secret-name":      "rook-csi-rbd-provisioner",
+				"volume.kubernetes.io/provisioner-deletion-secret-namespace": clusterns,
+			},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:           fmt.Sprintf("%s.rbd.csi.ceph.com", opns),
 					VolumeHandle:     "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002",
 					VolumeAttributes: map[string]string{},
+				},
+			},
+		},
+	}
+
+	staticCephfsPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-58469d41-f6c0-4720-b23a-0a0826b842cb",
+			Annotations: map[string]string{
+				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.cephfs.csi.ceph.com", opns),
+				"volume.kubernetes.io/provisioner-deletion-secret-name":      "rook-csi-cephfs-provisioner",
+				"volume.kubernetes.io/provisioner-deletion-secret-namespace": clusterns,
+			},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       fmt.Sprintf("%s.cephfs.csi.ceph.com", opns),
+					VolumeHandle: "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4001",
+					VolumeAttributes: map[string]string{
+						"staticVolume": "true",
+					},
 				},
 			},
 		},
@@ -252,15 +306,15 @@ func TestHandleNodeFailure(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pvc-58469d41-f6c0-4720-b23a-0a0826b841cc",
 			Annotations: map[string]string{
-				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.csi.rbd.com", ns),
+				"pv.kubernetes.io/provisioned-by":                            fmt.Sprintf("%s.csi.rbd.com", opns),
 				"volume.kubernetes.io/provisioner-deletion-secret-name":      "csi-rbd-provisioner",
-				"volume.kubernetes.io/provisioner-deletion-secret-namespace": ns,
+				"volume.kubernetes.io/provisioner-deletion-secret-namespace": clusterns,
 			},
 		},
 		Spec: corev1.PersistentVolumeSpec{
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
-					Driver:       fmt.Sprintf("%s.rbd.csi.com", ns),
+					Driver:       fmt.Sprintf("%s.rbd.csi.com", opns),
 					VolumeHandle: "0001-0009-csi-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002",
 					VolumeAttributes: map[string]string{
 						"pool":      "replicapool",
@@ -280,64 +334,117 @@ func TestHandleNodeFailure(t *testing.T) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "rook-ceph-mon",
-			Namespace: ns,
+			Namespace: clusterns,
 		},
 		Data: secrets,
 		Type: k8sutil.RookType,
 	}
-	_, err := c.context.Clientset.CoreV1().Secrets(ns).Create(ctx, secret, metav1.CreateOptions{})
+	_, err := c.context.Clientset.CoreV1().Secrets(clusterns).Create(ctx, secret, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
-	_, err = c.context.Clientset.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+	_, err = c.context.Clientset.CoreV1().PersistentVolumes().Create(ctx, rbdPV, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	_, err = c.context.Clientset.CoreV1().PersistentVolumes().Create(ctx, cephfsPV, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	_, err = c.context.ApiExtensionsClient.ApiextensionsV1().CustomResourceDefinitions().Create(ctx, &v1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "networkfences.csiaddons.openshift.io"}}, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	// When out-of-service taint is added
-	err = c.handleNodeFailure(ctx, cephCluster, node)
+	err = c.handleNodeFailure(ctx, cephCluster, node, opns)
 	assert.NoError(t, err)
 
-	networkFence := &addonsv1alpha1.NetworkFence{}
-	err = c.client.Get(ctx, types.NamespacedName{Name: node.Name, Namespace: cephCluster.Namespace}, networkFence)
+	networkFenceRbd := &addonsv1alpha1.NetworkFence{}
+	err = c.client.Get(ctx, types.NamespacedName{Name: fenceResourceName(node.Name, rbdDriver, clusterns)}, networkFenceRbd)
 	assert.NoError(t, err)
 
-	// For static pv
-	_, err = c.context.Clientset.CoreV1().PersistentVolumes().Create(ctx, staticPV, metav1.CreateOptions{})
+	networkFenceCephFs := &addonsv1alpha1.NetworkFence{}
+	err = c.client.Get(ctx, types.NamespacedName{Name: fenceResourceName(node.Name, cephfsDriver, clusterns)}, networkFenceCephFs)
+	assert.NoError(t, err)
+
+	networkFences := &addonsv1alpha1.NetworkFenceList{}
+	err = c.client.List(ctx, networkFences)
+	assert.NoError(t, err)
+	var rbdCount, cephFsCount int
+
+	for _, fence := range networkFences.Items {
+		// Check if the resource is in the desired namespace
+		if strings.Contains(fence.Name, rbdDriver) {
+			rbdCount++
+		} else if strings.Contains(fence.Name, cephfsDriver) {
+			cephFsCount++
+		}
+	}
+
+	assert.Equal(t, 1, rbdCount)
+	assert.Equal(t, 1, cephFsCount)
+
+	// For static rbd pv
+	_, err = c.context.Clientset.CoreV1().PersistentVolumes().Create(ctx, staticRbdPV, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	pvList, err := c.context.Clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	assert.NoError(t, err)
 
-	volumeInUse := getCephVolumesInUse(cephCluster, node.Status.VolumesInUse)
-	rbdPVList := listRBDPV(pvList, cephCluster, volumeInUse)
-	assert.Equal(t, len(rbdPVList), 1) // it will be equal to once since we have one pv provisioned by csi named `PV`
+	rbdVolumesInUse, _ := getCephVolumesInUse(cephCluster, node.Status.VolumesInUse, opns)
+	rbdPVList := listRBDPV(pvList, cephCluster, rbdVolumesInUse, opns)
+	assert.Equal(t, len(rbdPVList), 1) // it will be equal to one since we have one pv provisioned by csi named `rbdPV`
 
-	err = c.handleNodeFailure(ctx, cephCluster, node)
+	err = c.handleNodeFailure(ctx, cephCluster, node, opns)
 	assert.NoError(t, err)
 
-	// For static pv
+	// For static cephfs pv
+	_, err = c.context.Clientset.CoreV1().PersistentVolumes().Create(ctx, staticCephfsPV, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	pvList, err = c.context.Clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	assert.NoError(t, err)
+
+	_, cephFSVolumesInUse := getCephVolumesInUse(cephCluster, node.Status.VolumesInUse, opns)
+	cephFSVolumesInUseMap := make(map[string]struct{})
+	for _, vol := range cephFSVolumesInUse {
+		cephFSVolumesInUseMap[vol] = struct{}{}
+	}
+	cephFSPVList := listRWOCephFSPV(pvList, cephCluster, cephFSVolumesInUseMap, opns)
+	assert.Equal(t, len(cephFSPVList), 1) // it will be equal to one since we have one pv provisioned by csi named `cephfsPV`
+
+	err = c.handleNodeFailure(ctx, cephCluster, node, opns)
+	assert.NoError(t, err)
+
+	// For pv not provisioned by CSI
 	_, err = c.context.Clientset.CoreV1().PersistentVolumes().Create(ctx, pvNotProvisionByCSI, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	pvList, err = c.context.Clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	assert.NoError(t, err)
 
-	volumeInUse = getCephVolumesInUse(cephCluster, node.Status.VolumesInUse)
-	rbdPVList = listRBDPV(pvList, cephCluster, volumeInUse)
-	assert.Equal(t, len(rbdPVList), 1) // it will be equal to once since we have one pv provisioned by csi named `PV`
+	rbdVolumesInUse, _ = getCephVolumesInUse(cephCluster, node.Status.VolumesInUse, opns)
+	rbdPVList = listRBDPV(pvList, cephCluster, rbdVolumesInUse, opns)
+	assert.Equal(t, len(rbdPVList), 1) // it will be equal to one since we have one pv provisioned by csi named `PV`
 
-	err = c.handleNodeFailure(ctx, cephCluster, node)
+	err = c.handleNodeFailure(ctx, cephCluster, node, opns)
 	assert.NoError(t, err)
 
 	// When out-of-service taint is removed
 	node.Spec.Taints = []corev1.Taint{}
-
-	err = c.handleNodeFailure(ctx, cephCluster, node)
+	networkFenceRbd.Status.Message = addonsv1alpha1.UnFenceOperationSuccessfulMessage
+	err = c.client.Update(ctx, networkFenceRbd)
 	assert.NoError(t, err)
 
-	err = c.client.Get(ctx, types.NamespacedName{Name: node.Name, Namespace: cephCluster.Namespace}, networkFence)
+	networkFenceCephFs.Status.Message = addonsv1alpha1.UnFenceOperationSuccessfulMessage
+	err = c.client.Update(ctx, networkFenceCephFs)
+	assert.NoError(t, err)
+
+	err = c.handleNodeFailure(ctx, cephCluster, node, opns)
+	assert.NoError(t, err)
+
+	err = c.client.Get(ctx, types.NamespacedName{Name: fenceResourceName(node.Name, rbdDriver, clusterns), Namespace: cephCluster.Namespace}, networkFenceRbd)
 	assert.Error(t, err, kerrors.IsNotFound(err))
+
+	err = c.client.Get(ctx, types.NamespacedName{Name: fenceResourceName(node.Name, cephfsDriver, clusterns), Namespace: cephCluster.Namespace}, networkFenceCephFs)
+	assert.Error(t, err, kerrors.IsNotFound(err))
+
 }
 
 func TestGetCephVolumesInUse(t *testing.T) {
@@ -345,6 +452,8 @@ func TestGetCephVolumesInUse(t *testing.T) {
 	volInUse := []corev1.UniqueVolumeName{
 		"kubernetes.io/csi/rook-ceph.rbd.csi.ceph.com^0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002",
 		"kubernetes.io/csi/rook-ceph.rbd.csi.ceph.com^0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4003",
+		"kubernetes.io/csi/rook-ceph.cephfs.csi.ceph.com^0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4001",
+		"kubernetes.io/csi/rook-ceph.cephfs.csi.ceph.com^0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4004",
 	}
 
 	splitVolInUse := trimeVolumeInUse(volInUse[0])
@@ -355,9 +464,21 @@ func TestGetCephVolumesInUse(t *testing.T) {
 	assert.Equal(t, splitVolInUse[0], "rook-ceph.rbd.csi.ceph.com")
 	assert.Equal(t, splitVolInUse[1], "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4003")
 
-	trimVolInUse := getCephVolumesInUse(cephCluster, volInUse)
-	expected := []string{"0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002", "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4003"}
-	assert.Equal(t, expected, trimVolInUse)
+	splitVolInUse = trimeVolumeInUse(volInUse[2])
+	assert.Equal(t, splitVolInUse[0], "rook-ceph.cephfs.csi.ceph.com")
+	assert.Equal(t, splitVolInUse[1], "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4001")
+
+	splitVolInUse = trimeVolumeInUse(volInUse[3])
+	assert.Equal(t, splitVolInUse[0], "rook-ceph.cephfs.csi.ceph.com")
+	assert.Equal(t, splitVolInUse[1], "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4004")
+
+	trimRbdVolInUse, trimCephFSVolInUse := getCephVolumesInUse(cephCluster, volInUse, cephCluster.Namespace)
+
+	expectedRbd := []string{"0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4002", "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4003"}
+	expectedCephfs := []string{"0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4001", "0001-0009-rook-ceph-0000000000000002-24862838-240d-4215-9183-abfc0e9e4004"}
+
+	assert.Equal(t, expectedRbd, trimRbdVolInUse)
+	assert.Equal(t, expectedCephfs, trimCephFSVolInUse)
 }
 
 func TestRBDStatusUnMarshal(t *testing.T) {
@@ -371,6 +492,11 @@ func TestRBDStatusUnMarshal(t *testing.T) {
 func TestConcatenateWatcherIp(t *testing.T) {
 	WatcherIP := concatenateWatcherIp("192.168.39.137:0/3762982934")
 	assert.Equal(t, WatcherIP, "192.168.39.137/32")
+}
+
+func TestFenceResourceName(t *testing.T) {
+	FenceName := fenceResourceName("fakenode", "rbd", "rook-ceph")
+	assert.Equal(t, FenceName, "fakenode-rbd-rook-ceph")
 }
 
 func TestOnDeviceCMUpdate(t *testing.T) {

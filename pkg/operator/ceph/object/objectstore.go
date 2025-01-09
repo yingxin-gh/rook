@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,8 +31,6 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
-	"github.com/rook/rook/pkg/operator/ceph/config"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util"
 	"github.com/rook/rook/pkg/util/exec"
@@ -41,6 +40,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	validation "k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -53,8 +53,7 @@ const (
 	SecretKeyName         = "secret-key"
 	svcDNSSuffix          = "svc"
 	rgwRadosPoolPgNum     = "8"
-	cosiUserName          = "cosi"
-	cosiUserCaps          = "buckets=*;users=*"
+	rgwApplication        = "rgw"
 )
 
 var (
@@ -70,8 +69,7 @@ var (
 	dataPoolName = "rgw.buckets.data"
 
 	// An user with system privileges for dashboard service
-	DashboardUser                = "dashboard-admin"
-	rgwPgNumRemovedQuincyVersion = cephver.CephVersion{Major: 17, Minor: 2, Extra: 2}
+	DashboardUser = "dashboard-admin"
 )
 
 type idType struct {
@@ -206,7 +204,6 @@ func deleteSingleSiteRealmAndPools(objContext *Context, spec cephv1.ObjectStoreS
 
 // This is used for quickly getting the name of the realm, zone group, and zone for an object-store to pass into a Context
 func getMultisiteForObjectStore(ctx context.Context, clusterdContext *clusterd.Context, spec *cephv1.ObjectStoreSpec, namespace, name string) (string, string, string, error) {
-
 	if spec.IsExternal() {
 		// In https://github.com/rook/rook/issues/6342, it was determined that
 		// a multisite context isn't needed for external mode CephObjectStores.
@@ -392,7 +389,11 @@ func createMultisiteConfigurations(objContext *Context, configType, configTypeAr
 	args = append([]string{configType}, args...)
 	args = append(args, configTypeArg)
 	// get the multisite config before creating
-	output, getConfigErr := RunAdminCommandNoMultisite(objContext, true, configType, "get", configTypeArg)
+	configTypeArgs := []string{configType, "get", configTypeArg}
+	if configType == "zonegroup" {
+		configTypeArgs = append(configTypeArgs, fmt.Sprintf("--rgw-realm=%s", objContext.Realm))
+	}
+	output, getConfigErr := RunAdminCommandNoMultisite(objContext, true, configTypeArgs...)
 	if getConfigErr == nil {
 		return nil
 	}
@@ -423,7 +424,7 @@ func createMultisiteConfigurations(objContext *Context, configType, configTypeAr
 	return nil
 }
 
-func createMultisite(objContext *Context, endpointArg string) error {
+func createNonMultisiteStore(objContext *Context, endpointArg string, store *cephv1.CephObjectStore) error {
 	logger.Debugf("creating realm, zone group, zone for object-store %v", objContext.Name)
 
 	realmArg := fmt.Sprintf("--rgw-realm=%s", objContext.Realm)
@@ -445,12 +446,18 @@ func createMultisite(objContext *Context, endpointArg string) error {
 		return err
 	}
 
+	logger.Infof("Object store %q: realm=%s, zonegroup=%s, zone=%s", objContext.Name, objContext.Realm, objContext.ZoneGroup, objContext.Zone)
+
+	// Configure the zone for RADOS namespaces
+	err = ConfigureSharedPoolsForZone(objContext, store.Spec.SharedPools)
+	if err != nil {
+		return errors.Wrapf(err, "failed to configure rados namespaces for zone")
+	}
+
 	if err := commitConfigChanges(objContext); err != nil {
 		nsName := fmt.Sprintf("%s/%s", objContext.clusterInfo.Namespace, objContext.Name)
 		return errors.Wrapf(err, "failed to commit config changes after creating multisite config for CephObjectStore %q", nsName)
 	}
-
-	logger.Infof("Multisite for object-store: realm=%s, zonegroup=%s, zone=%s", objContext.Realm, objContext.ZoneGroup, objContext.Zone)
 
 	return nil
 }
@@ -539,7 +546,7 @@ func createSystemUser(objContext *Context, namespace string) error {
 	return nil
 }
 
-func setMultisite(objContext *Context, store *cephv1.CephObjectStore, zone *cephv1.CephObjectZone) error {
+func configureObjectStore(objContext *Context, store *cephv1.CephObjectStore, zone *cephv1.CephObjectZone) error {
 	logger.Debugf("setting multisite configuration for object-store %v", store.Name)
 
 	if store.Spec.IsMultisite() {
@@ -573,13 +580,13 @@ func setMultisite(objContext *Context, store *cephv1.CephObjectStore, zone *ceph
 		if !store.Spec.Gateway.DisableMultisiteSyncTraffic {
 			endpointArg = fmt.Sprintf("--endpoints=%s", objContext.Endpoint)
 		}
-		err := createMultisite(objContext, endpointArg)
+		err := createNonMultisiteStore(objContext, endpointArg, store)
 		if err != nil {
 			return errorOrIsNotFound(err, "failed create ceph multisite for object-store %q", objContext.Name)
 		}
 	}
 
-	logger.Infof("multisite configuration for object-store %v is complete", store.Name)
+	logger.Infof("configuration for object-store %v is complete", store.Name)
 	return nil
 }
 
@@ -711,6 +718,7 @@ func allObjectPools(storeName string) []string {
 	return poolsForThisStore
 }
 
+// Detect if there are pools that do not exist for this object store
 func missingPools(context *Context) ([]string, error) {
 	// list pools instead of querying each pool individually. querying each individually makes it
 	// hard to determine if an error is because the pool does not exist or because of a connection
@@ -735,8 +743,8 @@ func missingPools(context *Context) ([]string, error) {
 	return missingPools, nil
 }
 
-func CreatePools(context *Context, clusterSpec *cephv1.ClusterSpec, metadataPool, dataPool cephv1.PoolSpec) error {
-	if EmptyPool(dataPool) && EmptyPool(metadataPool) {
+func CreateObjectStorePools(context *Context, cluster *cephv1.ClusterSpec, metadataPool, dataPool cephv1.PoolSpec) error {
+	if EmptyPool(dataPool) || EmptyPool(metadataPool) {
 		logger.Info("no pools specified for the CR, checking for their existence...")
 		missingPools, err := missingPools(context)
 		if err != nil {
@@ -745,36 +753,325 @@ func CreatePools(context *Context, clusterSpec *cephv1.ClusterSpec, metadataPool
 		if len(missingPools) > 0 {
 			return fmt.Errorf("CR store pools are missing: %v", missingPools)
 		}
+
+		// pools exist, nothing to do
+		return nil
 	}
 
-	// get the default PG count for rgw metadata pools
-	var err error
-	var metadataPoolPGs string
-	if rgwRadosPGNumIsNew(context.clusterInfo.CephVersion) {
-		metadataPoolPGs = rgwRadosPoolPgNum
-	} else {
-		metadataPoolPGs, err = config.GetMonStore(context.Context, context.clusterInfo).Get("mon.", "rgw_rados_pool_pg_num_min")
-	}
-	if err != nil {
-		logger.Warningf("failed to adjust the PG count for rgw metadata pools. using the general default. %v", err)
-		metadataPoolPGs = cephclient.DefaultPGCount
-	}
-
-	if err := createSimilarPools(context, append(metadataPools, rootPool), clusterSpec, metadataPool, metadataPoolPGs); err != nil {
+	if err := createSimilarPools(context, append(metadataPools, rootPool), cluster, metadataPool, rgwRadosPoolPgNum); err != nil {
 		return errors.Wrap(err, "failed to create metadata pools")
 	}
 
-	if err := createSimilarPools(context, []string{dataPoolName}, clusterSpec, dataPool, cephclient.DefaultPGCount); err != nil {
+	if err := createSimilarPools(context, []string{dataPoolName}, cluster, dataPool, cephclient.DefaultPGCount); err != nil {
 		return errors.Wrap(err, "failed to create data pool")
 	}
 
 	return nil
 }
 
-// Check if this is a recent release of ceph where the legacy rgw_rados_pool_pg_num_min
-// is no longer available.
-func rgwRadosPGNumIsNew(cephVer cephver.CephVersion) bool {
-	return cephVer.IsAtLeast(rgwPgNumRemovedQuincyVersion)
+func ConfigureSharedPoolsForZone(objContext *Context, sharedPools cephv1.ObjectSharedPoolsSpec) error {
+	if sharedPools.DataPoolName == "" && sharedPools.MetadataPoolName == "" && len(sharedPools.PoolPlacements) == 0 {
+		logger.Debugf("no shared pools to configure for store %q", objContext.nsName())
+		return nil
+	}
+
+	logger.Infof("configuring shared pools for object store %q", objContext.nsName())
+	if err := sharedPoolsExist(objContext, sharedPools); err != nil {
+		return errors.Wrapf(err, "object store cannot be configured until shared pools exist")
+	}
+
+	zoneConfig, err := getZoneJSON(objContext)
+	if err != nil {
+		return err
+	}
+	zoneUpdated, err := adjustZoneDefaultPools(zoneConfig, sharedPools)
+	if err != nil {
+		return err
+	}
+	zoneUpdated, err = adjustZonePlacementPools(zoneUpdated, sharedPools)
+	if err != nil {
+		return err
+	}
+	hasZoneChanged := !reflect.DeepEqual(zoneConfig, zoneUpdated)
+
+	zoneGroupConfig, err := getZoneGroupJSON(objContext)
+	if err != nil {
+		return err
+	}
+	defaultPlacement := getDefaultPlacementName(sharedPools)
+	zoneGroupUpdated, err := adjustZoneGroupPlacementTargets(zoneGroupConfig, zoneUpdated, defaultPlacement)
+	if err != nil {
+		return err
+	}
+	hasZoneGroupChanged := !reflect.DeepEqual(zoneGroupConfig, zoneGroupUpdated)
+
+	// persist configuration updates:
+	if hasZoneChanged {
+		logger.Infof("zone config changed: performing zone config updates for %s", objContext.Zone)
+		updatedZoneResult, err := updateZoneJSON(objContext, zoneUpdated)
+		if err != nil {
+			return fmt.Errorf("unable to persist zone config update for %s: %w", objContext.Zone, err)
+		}
+		if err = zoneUpdateWorkaround(objContext, zoneUpdated, updatedZoneResult); err != nil {
+			return fmt.Errorf("failed to apply zone set workaround: %w", err)
+		}
+	}
+	if hasZoneGroupChanged {
+		logger.Infof("zonegroup config changed: performing zonegroup config updates for %s", objContext.ZoneGroup)
+		_, err = updateZoneGroupJSON(objContext, zoneGroupUpdated)
+		if err != nil {
+			return fmt.Errorf("unable to persist zonegroup config update for %s: %w", objContext.ZoneGroup, err)
+		}
+	}
+
+	return nil
+}
+
+func sharedPoolsExist(objContext *Context, sharedPools cephv1.ObjectSharedPoolsSpec) error {
+	existingPools, err := cephclient.ListPoolSummaries(objContext.Context, objContext.clusterInfo)
+	if err != nil {
+		return errors.Wrapf(err, "failed to list pools")
+	}
+	existing := make(map[string]struct{}, len(existingPools))
+	for _, pool := range existingPools {
+		existing[pool.Name] = struct{}{}
+	}
+	// sharedPools.MetadataPoolName, DataPoolName, and sharedPools.PoolPlacements.DataNonECPoolName are optional.
+	// ignore optional pools with empty name:
+	existing[""] = struct{}{}
+
+	if _, ok := existing[sharedPools.MetadataPoolName]; !ok {
+		return fmt.Errorf("sharedPool do not exist: %s", sharedPools.MetadataPoolName)
+	}
+	if _, ok := existing[sharedPools.DataPoolName]; !ok {
+		return fmt.Errorf("sharedPool do not exist: %s", sharedPools.DataPoolName)
+	}
+
+	for _, pp := range sharedPools.PoolPlacements {
+		if _, ok := existing[pp.MetadataPoolName]; !ok {
+			return fmt.Errorf("sharedPool does not exist: pool %s for placement %s", pp.MetadataPoolName, pp.Name)
+		}
+		if _, ok := existing[pp.DataPoolName]; !ok {
+			return fmt.Errorf("sharedPool do not exist: pool %s for placement %s", pp.DataPoolName, pp.Name)
+		}
+		if _, ok := existing[pp.DataNonECPoolName]; !ok {
+			return fmt.Errorf("sharedPool do not exist: pool %s for placement %s", pp.DataNonECPoolName, pp.Name)
+		}
+		for _, sc := range pp.StorageClasses {
+			if _, ok := existing[sc.DataPoolName]; !ok {
+				return fmt.Errorf("sharedPool do not exist: pool %s for StorageClass %s", sc.DataPoolName, sc.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
+func adjustZoneDefaultPools(zone map[string]interface{}, spec cephv1.ObjectSharedPoolsSpec) (map[string]interface{}, error) {
+	name, err := getObjProperty[string](zone, "name")
+	if err != nil {
+		return nil, fmt.Errorf("unable to get zone name: %w", err)
+	}
+
+	zone, err = deepCopyJson(zone)
+	if err != nil {
+		return nil, fmt.Errorf("unable to deep copy zone %s: %w", name, err)
+	}
+
+	defaultMetaPool := getDefaultMetadataPool(spec)
+	if defaultMetaPool == "" {
+		// default pool is not presented in shared pool spec
+		return zone, nil
+	}
+	// add zone namespace to metadata pool to safely share accorss rgw instances or zones.
+	// in non-multisite case zone name equals to rgw instance name
+	defaultMetaPool = defaultMetaPool + ":" + name
+	zonePoolNSSuffix := map[string]string{
+		"domain_root":     ".meta.root",
+		"control_pool":    ".control",
+		"gc_pool":         ".log.gc",
+		"lc_pool":         ".log.lc",
+		"log_pool":        ".log",
+		"intent_log_pool": ".log.intent",
+		"usage_log_pool":  ".log.usage",
+		"roles_pool":      ".meta.roles",
+		"reshard_pool":    ".log.reshard",
+		"user_keys_pool":  ".meta.users.keys",
+		"user_email_pool": ".meta.users.email",
+		"user_swift_pool": ".meta.users.swift",
+		"user_uid_pool":   ".meta.users.uid",
+		"otp_pool":        ".otp",
+		"notif_pool":      ".log.notif",
+		"topics_pool":     ".meta.topics",  // introduced in Ceph v19
+		"account_pool":    ".meta.account", // introduced in Ceph v19
+		"group_pool":      ".meta.group",   // introduced in Ceph v19
+	}
+	for pool, nsSuffix := range zonePoolNSSuffix {
+		// replace rgw internal index pools with namespaced metadata pool
+		namespacedPool := defaultMetaPool + nsSuffix
+		prev, err := updateObjProperty(zone, namespacedPool, pool)
+		if err != nil {
+			logger.Infof("unable to apply rados namespace to shared pool: %v", err)
+		}
+		if namespacedPool != prev {
+			logger.Debugf("update shared pool %s for zone %s: %s -> %s", pool, name, prev, namespacedPool)
+		}
+	}
+
+	// check for unknown pool properties in zone json
+	for field, val := range zone {
+		if _, ok := val.(string); !ok {
+			// not a string property
+			continue
+		}
+		if !strings.HasSuffix(field, "_pool") {
+			// not a pool property
+			continue
+		}
+		if _, ok := zonePoolNSSuffix[field]; !ok {
+			logger.Warningf("zone config %q contains unknown pool %q", name, field)
+		}
+	}
+
+	return zone, nil
+}
+
+// There was a radosgw-admin bug that was preventing the RADOS namespace from being applied
+// for the data pool. The fix is included in Reef v18.2.3 or newer, and v19.2.0.
+// The workaround is to run a "radosgw-admin zone placement modify" command to apply
+// the desired data pool config.
+// After Reef (v18) support is removed, this method will be dead code.
+func zoneUpdateWorkaround(objContext *Context, expectedZone, gotZone map[string]interface{}) error {
+	// Update the necessary fields for RAODS namespaces
+	// If the radosgw-admin fix is in the release, the data pool is already applied and we skip the workaround.
+	expected, err := getObjProperty[[]interface{}](expectedZone, "placement_pools")
+	if err != nil {
+		return err
+	}
+	got, err := getObjProperty[[]interface{}](gotZone, "placement_pools")
+	if err != nil {
+		return err
+	}
+	if len(expected) != len(got) {
+		// should not happen
+		return fmt.Errorf("placements were not applied to zone config: expected %+v, got %+v", expected, got)
+	}
+
+	// update pool placements one-by-one if needed
+	for i, expPl := range expected {
+		expPoolObj, ok := expPl.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("unable to cast pool placement to object: %+v", expPl)
+		}
+		expPoolName, err := getObjProperty[string](expPoolObj, "key")
+		if err != nil {
+			return fmt.Errorf("unable to get pool placement name: %w", err)
+		}
+
+		gotPoolObj, ok := got[i].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("unable to cast pool placement to object: %+v", got[i])
+		}
+		gotPoolName, err := getObjProperty[string](gotPoolObj, "key")
+		if err != nil {
+			return fmt.Errorf("unable to get pool placement name: %w", err)
+		}
+
+		if expPoolName != gotPoolName {
+			// should not happen
+			return fmt.Errorf("placements were not applied to zone config: expected %+v, got %+v", expected, got)
+		}
+		err = zoneUpdatePlacementWorkaround(objContext, gotPoolName, expPoolObj, gotPoolObj)
+		if err != nil {
+			return fmt.Errorf("unable to do zone update workaround for placement %q: %w", gotPoolName, err)
+		}
+	}
+	return nil
+}
+
+func zoneUpdatePlacementWorkaround(objContext *Context, placementID string, expect, got map[string]interface{}) error {
+	args := []string{
+		"zone", "placement", "modify",
+		"--rgw-realm=" + objContext.Realm,
+		"--rgw-zonegroup=" + objContext.ZoneGroup,
+		"--rgw-zone=" + objContext.Zone,
+		"--placement-id", placementID,
+	}
+	// check index and data pools
+	needsWorkaround := false
+	expPool, err := getObjProperty[string](expect, "val", "index_pool")
+	if err != nil {
+		return err
+	}
+	gotPool, err := getObjProperty[string](got, "val", "index_pool")
+	if err != nil {
+		return err
+	}
+	if expPool != gotPool {
+		logger.Infof("do zone update workaround for zone %s, placement %s index pool: %s -> %s", objContext.Zone, placementID, gotPool, expPool)
+		args = append(args, "--index-pool="+expPool)
+		needsWorkaround = true
+	}
+	expPool, err = getObjProperty[string](expect, "val", "data_extra_pool")
+	if err != nil {
+		return err
+	}
+	gotPool, err = getObjProperty[string](got, "val", "data_extra_pool")
+	if err != nil {
+		return err
+	}
+	if expPool != gotPool {
+		logger.Infof("do zone update workaround for zone %s, placement %s data extra pool: %s -> %s", objContext.Zone, placementID, gotPool, expPool)
+		args = append(args, "--data-extra-pool="+expPool)
+		needsWorkaround = true
+	}
+
+	if needsWorkaround {
+		_, err = RunAdminCommandNoMultisite(objContext, false, args...)
+		if err != nil {
+			return errors.Wrap(err, "failed to set zone config")
+		}
+	}
+	expSC, err := getObjProperty[map[string]interface{}](expect, "val", "storage_classes")
+	if err != nil {
+		return err
+	}
+	gotSC, err := getObjProperty[map[string]interface{}](got, "val", "storage_classes")
+	if err != nil {
+		return err
+	}
+
+	// check storage classes data pools
+	for sc := range expSC {
+		expDP, err := getObjProperty[string](expSC, sc, "data_pool")
+		if err != nil {
+			return err
+		}
+		gotDP, err := getObjProperty[string](gotSC, sc, "data_pool")
+		if err != nil {
+			return err
+		}
+		if expDP == gotDP {
+			continue
+		}
+		logger.Infof("do zone update workaround for zone %s, placement %s storage-class %s pool: %s -> %s", objContext.Zone, placementID, sc, gotDP, expDP)
+		args = []string{
+			"zone", "placement", "modify",
+			"--rgw-realm=" + objContext.Realm,
+			"--rgw-zonegroup=" + objContext.ZoneGroup,
+			"--rgw-zone=" + objContext.Zone,
+			"--placement-id", placementID,
+			"--storage-class", sc,
+			"--data-pool=" + expDP,
+		}
+		output, err := RunAdminCommandNoMultisite(objContext, false, args...)
+		if err != nil {
+			return errors.Wrap(err, "failed to set zone config")
+		}
+		logger.Debugf("zone placement modify output=%s", output)
+	}
+
+	return nil
 }
 
 // configurePoolsConcurrently checks if operator pod resources are set or not
@@ -787,7 +1084,7 @@ func configurePoolsConcurrently() bool {
 	return true
 }
 
-func createSimilarPools(ctx *Context, pools []string, clusterSpec *cephv1.ClusterSpec, poolSpec cephv1.PoolSpec, pgCount string) error {
+func createSimilarPools(ctx *Context, pools []string, cluster *cephv1.ClusterSpec, poolSpec cephv1.PoolSpec, pgCount string) error {
 	// We have concurrency
 	if configurePoolsConcurrently() {
 		waitGroup, _ := errgroup.WithContext(ctx.clusterInfo.Context)
@@ -795,14 +1092,14 @@ func createSimilarPools(ctx *Context, pools []string, clusterSpec *cephv1.Cluste
 			// Avoid the loop re-using the same value with a closure
 			pool := pool
 
-			waitGroup.Go(func() error { return createRGWPool(ctx, clusterSpec, poolSpec, pgCount, pool) })
+			waitGroup.Go(func() error { return createRGWPool(ctx, cluster, poolSpec, pgCount, pool) })
 		}
 		return waitGroup.Wait()
 	}
 
 	// No concurrency!
 	for _, pool := range pools {
-		err := createRGWPool(ctx, clusterSpec, poolSpec, pgCount, pool)
+		err := createRGWPool(ctx, cluster, poolSpec, pgCount, pool)
 		if err != nil {
 			return err
 		}
@@ -811,13 +1108,14 @@ func createSimilarPools(ctx *Context, pools []string, clusterSpec *cephv1.Cluste
 	return nil
 }
 
-func createRGWPool(ctx *Context, clusterSpec *cephv1.ClusterSpec, poolSpec cephv1.PoolSpec, pgCount, requestedName string) error {
+func createRGWPool(ctx *Context, cluster *cephv1.ClusterSpec, poolSpec cephv1.PoolSpec, pgCount, requestedName string) error {
 	// create the pool if it doesn't exist yet
+	poolSpec.Application = rgwApplication
 	pool := cephv1.NamedPoolSpec{
 		Name:     poolName(ctx.Name, requestedName),
 		PoolSpec: poolSpec,
 	}
-	if err := cephclient.CreatePoolWithPGs(ctx.Context, ctx.clusterInfo, clusterSpec, pool, AppName, pgCount); err != nil {
+	if err := cephclient.CreatePoolWithPGs(ctx.Context, ctx.clusterInfo, cluster, &pool, pgCount); err != nil {
 		return errors.Wrapf(err, "failed to create pool %q", pool.Name)
 	}
 	// Set the pg_num_min if not the default so the autoscaler won't immediately increase the pg count
@@ -839,13 +1137,20 @@ func poolName(poolPrefix, poolName string) string {
 }
 
 // GetObjectBucketProvisioner returns the bucket provisioner name appended with operator namespace if OBC is watching on it
-func GetObjectBucketProvisioner(data map[string]string, namespace string) string {
+func GetObjectBucketProvisioner(data map[string]string, namespace string) (string, error) {
 	provName := bucketProvisionerName
 	obcWatchOnNamespace := k8sutil.GetValue(data, "ROOK_OBC_WATCH_OPERATOR_NAMESPACE", "false")
-	if strings.EqualFold(obcWatchOnNamespace, "true") {
+	obcProvisionerNamePrefix := k8sutil.GetValue(data, "ROOK_OBC_PROVISIONER_NAME_PREFIX", "")
+	if obcProvisionerNamePrefix != "" {
+		errList := validation.IsDNS1123Label(obcProvisionerNamePrefix)
+		if len(errList) > 0 {
+			return "", errors.Errorf("invalid OBC provisioner name prefix %q. %v", obcProvisionerNamePrefix, errList)
+		}
+		provName = fmt.Sprintf("%s.%s", obcProvisionerNamePrefix, bucketProvisionerName)
+	} else if obcWatchOnNamespace == "true" {
 		provName = fmt.Sprintf("%s.%s", namespace, bucketProvisionerName)
 	}
-	return provName
+	return provName, nil
 }
 
 // CheckDashboardUser returns true if the dashboard user exists and has the same credentials as the given user, else return false
@@ -1087,4 +1392,18 @@ func CheckIfZonePresentInZoneGroup(objContext *Context) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// ValidateObjectStorePoolsConfig returns error if given ObjectStore pool configuration is inconsistent.
+func ValidateObjectStorePoolsConfig(metadataPool, dataPool cephv1.PoolSpec, sharedPools cephv1.ObjectSharedPoolsSpec) error {
+	if err := validatePoolPlacements(sharedPools.PoolPlacements); err != nil {
+		return err
+	}
+	if !EmptyPool(dataPool) && sharedPools.DataPoolName != "" {
+		return fmt.Errorf("invalidObjStorePoolConfig: object store dataPool and sharedPools.dataPool=%s are mutually exclusive. Only one of them can be set.", sharedPools.DataPoolName)
+	}
+	if !EmptyPool(metadataPool) && sharedPools.MetadataPoolName != "" {
+		return fmt.Errorf("invalidObjStorePoolConfig: object store metadataPool and sharedPools.metadataPool=%s are mutually exclusive. Only one of them can be set.", sharedPools.MetadataPoolName)
+	}
+	return nil
 }

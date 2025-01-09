@@ -32,7 +32,7 @@ all: build
 
 # Controller-gen version
 # f284e2e8... is master ahead of v0.5.0 which has ability to generate embedded objectmeta in CRDs
-CONTROLLER_GEN_VERSION=v0.11.3
+CONTROLLER_GEN_VERSION=v0.16.1
 
 # Set GOBIN
 ifeq (,$(shell go env GOBIN))
@@ -118,11 +118,6 @@ build.version:
 	@mkdir -p $(OUTPUT_DIR)
 	@echo "$(VERSION)" > $(OUTPUT_DIR)/version
 
-# Change how CRDs are generated for CSVs
-ifneq ($(REAL_HOST_PLATFORM),darwin_arm64)
-build.common: export NO_OB_OBC_VOL_GEN=true
-build.common: export MAX_DESC_LEN=0
-endif
 build.common: export SKIP_GEN_CRD_DOCS=true
 build.common: build.version helm.build mod.check crds gen-rbac
 	@$(MAKE) go.init
@@ -134,7 +129,7 @@ do.build.platform.%:
 
 do.build.parallel: $(foreach p,$(PLATFORMS_TO_BUILD_FOR), do.build.platform.$(p))
 
-build: csv-clean build.common ## Only build for linux platform
+build: build.common ## Only build for linux platform
 	@$(MAKE) go.build PLATFORM=linux_$(GOHOSTARCH)
 	@$(MAKE) -C images PLATFORM=linux_$(GOHOSTARCH)
 
@@ -166,13 +161,14 @@ fmt: ## Check formatting of go sources.
 	@$(MAKE) go.init
 	@$(MAKE) go.fmt
 
+gen.codegen: codegen
 codegen: ${CODE_GENERATOR} ## Run code generators.
 	@build/codegen/codegen.sh
 
 mod.check: go.mod.check ## Check if any go modules changed.
 mod.update: go.mod.update ## Update all go modules.
 
-clean: csv-clean ## Remove all files that are created by building.
+clean: ## Remove all files that are created by building.
 	@$(MAKE) go.mod.clean
 	@$(MAKE) -C images clean
 	@rm -fr $(OUTPUT_DIR) $(WORK_DIR)
@@ -183,30 +179,22 @@ distclean: clean ## Remove all files that are created by building or configuring
 prune: ## Prune cached artifacts.
 	@$(MAKE) -C images prune
 
-# Change how CRDs are generated for CSVs
-csv: export MAX_DESC_LEN=0 # sets the description length to 0 since CSV cannot be bigger than 1MB
-csv: export NO_OB_OBC_VOL_GEN=true
-csv: csv-clean crds ## Generate a CSV file for OLM.
-	$(MAKE) -C images/ceph csv
-
-csv-clean: ## Remove existing OLM files.
-	@$(MAKE) -C images/ceph csv-clean
-
-docs: helm-docs
-	@build/deploy/generate-deploy-examples.sh
-
+gen.crds: crds
 crds: $(CONTROLLER_GEN) $(YQ)
 	@echo Updating CRD manifests
 	@build/crds/build-crds.sh $(CONTROLLER_GEN) $(YQ)
 	@GOBIN=$(GOBIN) build/crds/generate-crd-docs.sh
-	@build/crds/validate-csv-crd-list.sh
 
+gen.rbac: gen-rbac
 gen-rbac: $(HELM) $(YQ) ## Generate RBAC from Helm charts
 	@# output only stdout to the file; stderr for debugging should keep going to stderr
 	HELM=$(HELM) ./build/rbac/gen-common.sh
 	HELM=$(HELM) ./build/rbac/gen-nfs-rbac.sh
 	HELM=$(HELM) ./build/rbac/gen-psp.sh
 
+gen.docs: docs
+docs: helm-docs
+gen.helm-docs: helm-docs
 helm-docs: $(HELM_DOCS) ## Use helm-docs to generate documentation from helm charts
 	$(HELM_DOCS) -c deploy/charts/rook-ceph \
 		-o ../../../Documentation/Helm-Charts/operator-chart.md \
@@ -217,31 +205,21 @@ helm-docs: $(HELM_DOCS) ## Use helm-docs to generate documentation from helm cha
 		-t ../../../Documentation/Helm-Charts/ceph-cluster-chart.gotmpl.md \
 		-t ../../../Documentation/Helm-Charts/_templates.gotmpl
 
-check-helm-docs:
-	@$(MAKE) helm-docs
-	@git diff --exit-code || { \
-	echo "Please run 'make helm-docs' locally, commit the updated docs, and push the change. See https://rook.io/docs/rook/latest/Contributing/documentation/#making-docs" ; \
-	exit 2 ; \
-	};
-check-docs:
-	@$(MAKE) docs
-	@git diff --exit-code || { \
-	echo "Please run 'make docs' locally, commit the updated docs, and push the change." ; \
-	exit 2 ; \
-	};
-
-
 docs-preview: ## Preview the documentation through mkdocs
 	mkdocs serve
 
 docs-build:  ## Build the documentation to the `site/` directory
 	mkdocs build --strict
 
+gen.crd-docs: generate-docs-crds
 generate-docs-crds: ## Build the documentation for CRD
 	@GOBIN=$(GOBIN) build/crds/generate-crd-docs.sh
 
+generate: gen.codegen gen.crds gen.rbac gen.docs gen.crd-docs ## Update all generated files (code, manifests, charts, and docs).
+
+
 .PHONY: all build.common
-.PHONY: build build.all install test check vet fmt codegen mod.check clean distclean prune
+.PHONY: build build.all install test check vet fmt codegen gen.codegen gen.rbac gen.crds gen.crd-docs gen.docs gen.helm-docs generate mod.check clean distclean prune
 
 # ====================================================================================
 # Help

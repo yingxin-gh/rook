@@ -20,7 +20,9 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
+	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -31,12 +33,12 @@ import (
 	"github.com/rook/rook/pkg/daemon/ceph/osd/kms"
 	cephconfig "github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -68,11 +70,10 @@ chown --recursive --verbose ceph:ceph $VAULT_TOKEN_NEW_PATH
 )
 
 var (
-	cephVersionMinRGWSSES3     = cephver.CephVersion{Major: 17, Minor: 2, Extra: 3}
-	cephVersionMinRGWSSEKMSTLS = cephver.CephVersion{Major: 16, Minor: 2, Extra: 6}
-
 	//go:embed rgw-probe.sh
 	rgwProbeScriptTemplate string
+
+	rgwAPIwithoutS3 = []string{"s3website", "swift", "swift_auth", "admin", "sts", "iam", "notifications"}
 )
 
 type ProbeType string
@@ -91,6 +92,7 @@ type rgwProbeConfig struct {
 
 	Protocol ProtocolType
 	Port     string
+	Path     string
 }
 
 func (c *clusterConfig) createDeployment(rgwConfig *rgwConfig) (*apps.Deployment, error) {
@@ -116,6 +118,7 @@ func (c *clusterConfig) createDeployment(rgwConfig *rgwConfig) (*apps.Deployment
 			Labels:    getLabels(c.store.Name, c.store.Namespace, true),
 		},
 		Spec: apps.DeploymentSpec{
+			RevisionHistoryLimit: controller.RevisionHistoryLimit(),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: getLabels(c.store.Name, c.store.Namespace, false),
 			},
@@ -151,14 +154,30 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) (v1.PodTemplateSpec
 		),
 		HostNetwork:        hostNetwork,
 		PriorityClassName:  c.store.Spec.Gateway.PriorityClassName,
+		SecurityContext:    &v1.PodSecurityContext{},
 		ServiceAccountName: serviceAccountName,
+	}
+
+	opsLogFile := ""
+	if opsLogSidecar := c.store.Spec.Gateway.OpsLogSidecar; opsLogSidecar != nil {
+		// Generate ops log file name based on rgw daemon ID
+		opsLogName := fmt.Sprintf("ops-log-%s.log", getDaemonName(rgwConfig))
+		opsLogFile = path.Join(cephconfig.VarLogCephDir, opsLogName)
+
+		// Add the side-car container named ops-log
+		podSpec.Containers = append(podSpec.Containers,
+			*controller.RgwOpsLogSidecarContainer(opsLogName,
+				c.clusterInfo.Namespace, *c.clusterSpec,
+				opsLogSidecar.Resources))
 	}
 
 	// If the log collector is enabled we add the side-car container
 	if c.clusterSpec.LogCollector.Enabled {
 		shareProcessNamespace := true
 		podSpec.ShareProcessNamespace = &shareProcessNamespace
-		podSpec.Containers = append(podSpec.Containers, *controller.LogCollectorContainer(getDaemonName(rgwConfig), c.clusterInfo.Namespace, *c.clusterSpec))
+		podSpec.Containers = append(podSpec.Containers,
+			*controller.LogCollectorContainer(getDaemonName(rgwConfig),
+				c.clusterInfo.Namespace, *c.clusterSpec, opsLogFile))
 	}
 
 	// Replace default unreachable node toleration
@@ -252,6 +271,10 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) (v1.PodTemplateSpec
 			return podTemplateSpec, err
 		}
 	}
+
+	addVols, addMounts := c.store.Spec.Gateway.AdditionalVolumeMounts.GenerateVolumesAndMounts("/var/rgw/")
+	podTemplateSpec.Spec.Volumes = append(podTemplateSpec.Spec.Volumes, addVols...)
+	podTemplateSpec.Spec.Containers[0].VolumeMounts = append(podTemplateSpec.Spec.Containers[0].VolumeMounts, addMounts...)
 
 	return podTemplateSpec, nil
 }
@@ -392,32 +415,49 @@ func (c *clusterConfig) makeDaemonContainer(rgwConfig *rgwConfig) (v1.Container,
 		if c.store.Spec.Security.KeyManagementService.IsTokenAuthEnabled() {
 			container.Args = append(container.Args, c.sseKMSVaultTokenOptions(kmsEnabled)...)
 		}
-		if c.store.Spec.Security.KeyManagementService.IsTLSEnabled() &&
-			c.clusterInfo.CephVersion.IsAtLeast(cephVersionMinRGWSSEKMSTLS) {
+		if c.store.Spec.Security.KeyManagementService.IsTLSEnabled() {
 			container.Args = append(container.Args, c.sseKMSVaultTLSOptions(kmsEnabled)...)
 		}
 	}
 
-	s3Enabled, err := c.CheckRGWSSES3Enabled()
+	if flags := buildRGWConfigFlags(c.store); len(flags) != 0 {
+		container.Args = append(container.Args, flags...)
+	}
+
+	s3EncryptionEnabled, err := c.CheckRGWSSES3Enabled()
 	if err != nil {
 		return v1.Container{}, err
 	}
-	if s3Enabled {
+	if s3EncryptionEnabled {
 		logger.Debugf("enabliing SSE-S3. %v", c.store.Spec.Security.ServerSideEncryptionS3)
 
-		container.Args = append(container.Args, c.sseS3DefaultOptions(s3Enabled)...)
+		container.Args = append(container.Args, c.sseS3DefaultOptions(s3EncryptionEnabled)...)
 		if c.store.Spec.Security.ServerSideEncryptionS3.IsTokenAuthEnabled() {
-			container.Args = append(container.Args, c.sseS3VaultTokenOptions(s3Enabled)...)
+			container.Args = append(container.Args, c.sseS3VaultTokenOptions(s3EncryptionEnabled)...)
 		}
 		if c.store.Spec.Security.ServerSideEncryptionS3.IsTLSEnabled() {
-			container.Args = append(container.Args, c.sseS3VaultTLSOptions(s3Enabled)...)
+			container.Args = append(container.Args, c.sseS3VaultTLSOptions(s3EncryptionEnabled)...)
 		}
 	}
 
-	if s3Enabled || kmsEnabled {
+	if s3EncryptionEnabled || kmsEnabled {
 		vaultVolMount := v1.VolumeMount{Name: rgwVaultVolumeName, MountPath: rgwVaultDirName}
 		container.VolumeMounts = append(container.VolumeMounts, vaultVolMount)
 	}
+
+	hostingOptions, err := c.addDNSNamesToRGWServer()
+	if err != nil {
+		return v1.Container{}, err
+	}
+	if hostingOptions != "" {
+		container.Args = append(container.Args, hostingOptions)
+	}
+
+	// user configs are very last arguments so that they override what Rook might be setting before
+	for flag, val := range c.store.Spec.Gateway.RgwCommandFlags {
+		container.Args = append(container.Args, cephconfig.NewFlag(flag, val))
+	}
+
 	return container, nil
 }
 
@@ -448,11 +488,17 @@ func noLivenessProbe() *v1.Probe {
 }
 
 func (c *clusterConfig) defaultReadinessProbe() (*v1.Probe, error) {
+	probePath, disableProbe := getRGWProbePath(c.store.Spec.Protocols)
+	if disableProbe {
+		logger.Infof("disabling startup probe for %q store", c.store.Name)
+		return nil, nil
+	}
 	proto, port := c.endpointInfo()
 	cfg := rgwProbeConfig{
 		ProbeType: ReadinessProbeType,
 		Protocol:  proto,
 		Port:      port.String(),
+		Path:      probePath,
 	}
 	script, err := renderProbe(cfg)
 	if err != nil {
@@ -478,13 +524,52 @@ func (c *clusterConfig) defaultReadinessProbe() (*v1.Probe, error) {
 	return probe, nil
 }
 
+// getRGWProbePath - returns custom path for RGW probe and returns true if probe should be disabled.
+func getRGWProbePath(protocolSpec cephv1.ProtocolSpec) (path string, disable bool) {
+	enabledAPIs := buildRGWEnableAPIsConfigVal(protocolSpec)
+	if len(enabledAPIs) == 0 {
+		// all apis including s3 are enabled
+		// using default s3 Probe
+		return "", false
+	}
+	if slices.Contains(enabledAPIs, "s3") {
+		// using default s3 Probe
+		return "", false
+	}
+	if slices.Contains(enabledAPIs, "swift") {
+		// using swift api for probe
+		// calculate path for swift probe
+		prefix := "/swift/"
+		if protocolSpec.Swift != nil && protocolSpec.Swift.UrlPrefix != nil && *protocolSpec.Swift.UrlPrefix != "" {
+			prefix = *protocolSpec.Swift.UrlPrefix
+			if !strings.HasPrefix(prefix, "/") {
+				prefix = "/" + prefix
+			}
+			if !strings.HasSuffix(prefix, "/") {
+				prefix += "/"
+			}
+		}
+		prefix += "info"
+		return prefix, false
+	}
+	// both swift and s3 are disabled - disable probe.
+	return "", true
+}
+
 func (c *clusterConfig) defaultStartupProbe() (*v1.Probe, error) {
+	probePath, disableProbe := getRGWProbePath(c.store.Spec.Protocols)
+	if disableProbe {
+		logger.Infof("disabling startup probe for %q store", c.store.Name)
+		return nil, nil
+	}
 	proto, port := c.endpointInfo()
 	cfg := rgwProbeConfig{
 		ProbeType: StartupProbeType,
 		Protocol:  proto,
 		Port:      port.String(),
+		Path:      probePath,
 	}
+
 	script, err := renderProbe(cfg)
 	if err != nil {
 		return nil, err
@@ -680,9 +765,6 @@ func (c *clusterConfig) CheckRGWKMS() (bool, error) {
 
 func (c *clusterConfig) CheckRGWSSES3Enabled() (bool, error) {
 	if c.store.Spec.Security != nil && c.store.Spec.Security.ServerSideEncryptionS3.IsEnabled() {
-		if !c.clusterInfo.CephVersion.IsAtLeast(cephVersionMinRGWSSES3) {
-			return false, errors.New("minimum ceph quincy is required for AWS-SSE:S3")
-		}
 		err := kms.ValidateConnectionDetails(c.clusterInfo.Context, c.context, &c.store.Spec.Security.ServerSideEncryptionS3, c.store.Namespace)
 		if err != nil {
 			return false, err
@@ -896,6 +978,46 @@ func (c *clusterConfig) sseS3VaultTLSOptions(setOptions bool) []string {
 	return rgwOptions
 }
 
+// Builds list of rgw config parameters which should be passed as CLI flags.
+// Consider set config option as flag if BOTH criteria fulfilled:
+//  1. config value is not secret
+//  2. config change requires RGW daemon restart
+//
+// Otherwise set rgw config parameter to mon database in ./config.go -> setFlagsMonConfigStore()
+// CLI flags override values from mon db: see ceph config docs: https://docs.ceph.com/en/latest/rados/configuration/ceph-conf/#config-sources
+func buildRGWConfigFlags(objectStore *cephv1.CephObjectStore) []string {
+	var res []string
+	// todo: move all flags here
+	if enableAPIs := buildRGWEnableAPIsConfigVal(objectStore.Spec.Protocols); len(enableAPIs) != 0 {
+		res = append(res, cephconfig.NewFlag("rgw_enable_apis", strings.Join(enableAPIs, ",")))
+		logger.Debugf("Enabling APIs for RGW instance %q: %s", objectStore.Name, enableAPIs)
+	}
+	return res
+}
+
+func buildRGWEnableAPIsConfigVal(protocolSpec cephv1.ProtocolSpec) []string {
+	if len(protocolSpec.EnableAPIs) != 0 {
+		// handle explicit enabledAPIS spec
+		enabledAPIs := make([]string, len(protocolSpec.EnableAPIs))
+		for i, v := range protocolSpec.EnableAPIs {
+			enabledAPIs[i] = strings.TrimSpace(string(v))
+		}
+		return enabledAPIs
+	}
+
+	// if enabledAPIs not set, check if S3 should be disabled
+	if protocolSpec.S3 != nil && protocolSpec.S3.Enabled != nil && !*protocolSpec.S3.Enabled { //nolint // disable deprecation check
+		return rgwAPIwithoutS3
+	}
+	// see also https://docs.ceph.com/en/octopus/radosgw/config-ref/#swift-settings on disabling s3
+	// when using '/' as prefix
+	if protocolSpec.Swift != nil && protocolSpec.Swift.UrlPrefix != nil && *protocolSpec.Swift.UrlPrefix == "/" {
+		logger.Warning("Forcefully disabled S3 as the swift prefix is given as a slash /. Ignoring any S3 options (including Enabled=true)!")
+		return rgwAPIwithoutS3
+	}
+	return nil
+}
+
 func renderProbe(cfg rgwProbeConfig) (string, error) {
 	var writer bytes.Buffer
 	name := string(cfg.ProbeType) + "-probe"
@@ -911,4 +1033,100 @@ func renderProbe(cfg rgwProbeConfig) (string, error) {
 	}
 
 	return writer.String(), nil
+}
+
+func (c *clusterConfig) addDNSNamesToRGWServer() (string, error) {
+	if c.store.Spec.Hosting == nil {
+		return "", nil
+	}
+	if !c.store.AdvertiseEndpointIsSet() && len(c.store.Spec.Hosting.DNSNames) == 0 {
+		return "", nil
+	}
+	if !c.clusterInfo.CephVersion.IsAtLeastReef() {
+		return "", errors.New("rgw dns names are supported from ceph v18 onwards")
+	}
+
+	dnsNames := []string{}
+
+	if c.store.AdvertiseEndpointIsSet() {
+		dnsNames = append(dnsNames, c.store.Spec.Hosting.AdvertiseEndpoint.DnsName)
+	}
+
+	dnsNames = append(dnsNames, c.store.Spec.Hosting.DNSNames...)
+
+	// add default RGW service domain name to ensure RGW doesn't reject it
+	dnsNames = append(dnsNames, c.store.GetServiceDomainName())
+
+	// add custom endpoints from zone spec if exists
+	if c.store.Spec.Zone.Name != "" {
+		zone, err := c.context.RookClientset.CephV1().CephObjectZones(c.store.Namespace).Get(c.clusterInfo.Context, c.store.Spec.Zone.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", err
+		}
+		dnsNames = append(dnsNames, zone.Spec.CustomEndpoints...)
+	}
+
+	// validate dns names
+	var hostNames []string
+	for _, dnsName := range dnsNames {
+		hostName, err := GetHostnameFromEndpoint(dnsName)
+		if err != nil {
+			return "", errors.Wrap(err,
+				"failed to interpret endpoint from one of the following sources: CephObjectStore.spec.hosting.dnsNames, CephObjectZone.spec.customEndpoints")
+		}
+		hostNames = append(hostNames, hostName)
+	}
+
+	// remove duplicate host names
+	checkDuplicate := make(map[string]bool)
+	removeDuplicateHostNames := []string{}
+	for _, hostName := range hostNames {
+		if _, ok := checkDuplicate[hostName]; !ok {
+			checkDuplicate[hostName] = true
+			removeDuplicateHostNames = append(removeDuplicateHostNames, hostName)
+		}
+	}
+
+	return cephconfig.NewFlag("rgw dns name", strings.Join(removeDuplicateHostNames, ",")), nil
+}
+
+func GetHostnameFromEndpoint(endpoint string) (string, error) {
+	if len(endpoint) == 0 {
+		return "", fmt.Errorf("endpoint cannot be empty string")
+	}
+
+	// if endpoint doesn't end in '/', Ceph adds it
+	// Rook can do this also to get more accurate error results from this function
+	if !strings.HasSuffix(endpoint, "/") {
+		endpoint = endpoint + "/"
+	}
+
+	// url.Parse() requires a protocol to parse the host name correctly
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "http://" + endpoint
+	}
+
+	// "net/url".Parse() assumes that a URL is a "path" with optional things surrounding it.
+	// For Ceph RGWs, we assume an endpoint is a "hostname" with optional things surrounding it.
+	// Because of this difference in fundamental assumption, Rook needs to adjust some endpoints
+	// used as input to url.Parse() to allow the function to extract a hostname reliably. Also,
+	// Rook needs to look at several parts of the url.Parse() output to identify more failure scenarios
+	parsedURL, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
+	}
+
+	// error in this case: url.Parse("https://http://hostname") parses without error with `Host = "http:"`
+	// also catches issue where user adds colon but no port number after
+	if strings.HasSuffix(parsedURL.Host, ":") {
+		return "", fmt.Errorf("host %q parsed from endpoint %q has invalid colon (:) placement", parsedURL.Host, endpoint)
+	}
+
+	hostname := parsedURL.Hostname()
+	dnsErrs := validation.IsDNS1123Subdomain(parsedURL.Hostname())
+	if len(dnsErrs) > 0 {
+		return "", fmt.Errorf("hostname %q parsed from endpoint %q is not a valid DNS-1123 subdomain: %v", hostname, endpoint, strings.Join(dnsErrs, ", "))
+	}
+
+	return hostname, nil
 }

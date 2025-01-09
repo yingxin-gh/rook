@@ -4,7 +4,7 @@ set -e
 ##############
 # VARIABLES #
 #############
-NAMESPACE=${NAMESPACE:="rook-ceph-external"}
+NAMESPACE=${NAMESPACE:="rook-ceph"}
 MON_SECRET_NAME=rook-ceph-mon
 RGW_ADMIN_OPS_USER_SECRET_NAME=rgw-admin-ops-user
 MON_SECRET_CLUSTER_NAME_KEYNAME=cluster-name
@@ -14,16 +14,19 @@ MON_SECRET_MON_KEYRING_KEYNAME=mon-secret
 MON_SECRET_CEPH_USERNAME_KEYNAME=ceph-username
 MON_SECRET_CEPH_SECRET_KEYNAME=ceph-secret
 MON_ENDPOINT_CONFIGMAP_NAME=rook-ceph-mon-endpoints
+EXTERNAL_COMMAND_CONFIGMAP_NAME=external-cluster-user-command
 ROOK_EXTERNAL_CLUSTER_NAME=$NAMESPACE
 ROOK_RBD_FEATURES=${ROOK_RBD_FEATURES:-"layering"}
 ROOK_EXTERNAL_MAX_MON_ID=2
 ROOK_EXTERNAL_MAPPING={}
 RBD_STORAGE_CLASS_NAME=ceph-rbd
+RBD_TOPOLOGY_STORAGE_CLASS_NAME=ceph-rbd-topology
 CEPHFS_STORAGE_CLASS_NAME=cephfs
 ROOK_EXTERNAL_MONITOR_SECRET=mon-secret
-OPERATOR_NAMESPACE=rook-ceph                                 # default set to rook-ceph
-RBD_PROVISIONER=$OPERATOR_NAMESPACE".rbd.csi.ceph.com"       # driver:namespace:operator
-CEPHFS_PROVISIONER=$OPERATOR_NAMESPACE".cephfs.csi.ceph.com" # driver:namespace:operator
+OPERATOR_NAMESPACE=rook-ceph # default set to rook-ceph
+CSI_DRIVER_NAME_PREFIX=${CSI_DRIVER_NAME_PREFIX:-$OPERATOR_NAMESPACE}
+RBD_PROVISIONER=$CSI_DRIVER_NAME_PREFIX".rbd.csi.ceph.com"       # csi-provisioner-name
+CEPHFS_PROVISIONER=$CSI_DRIVER_NAME_PREFIX".cephfs.csi.ceph.com" # csi-provisioner-name
 CLUSTER_ID_RBD=$NAMESPACE
 CLUSTER_ID_CEPHFS=$NAMESPACE
 : "${ROOK_EXTERNAL_ADMIN_SECRET:=admin-secret}"
@@ -65,11 +68,17 @@ function checkEnvVars() {
     echo "Providing both ROOK_EXTERNAL_ADMIN_SECRET and ROOK_EXTERNAL_USER_SECRET is not supported, choose one only."
     exit 1
   fi
+  if [ -n "$KUBECONTEXT" ]; then
+    echo "Using $KUBECONTEXT as the context value for kubectl commands"
+    KUBECTL="kubectl --context=$KUBECONTEXT"
+  else
+    KUBECTL="kubectl"
+  fi
 }
 
 function createClusterNamespace() {
-  if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
-    kubectl \
+  if ! $KUBECTL get namespace "$NAMESPACE" &>/dev/null; then
+    $KUBECTL \
       create \
       namespace \
       "$NAMESPACE"
@@ -78,18 +87,59 @@ function createClusterNamespace() {
   fi
 }
 
+function createRadosNamespaceCR() {
+  if ! $KUBECTL -n "$NAMESPACE" get CephBlockPoolRadosNamespace $RADOS_NAMESPACE &>/dev/null; then
+    cat <<eof | $KUBECTL create -f -
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPoolRadosNamespace
+metadata:
+  name: $RADOS_NAMESPACE
+  namespace: $NAMESPACE # namespace:cluster
+spec:
+  # blockPoolName is the name of the CephBlockPool CR where the namespace will be created.
+  blockPoolName: $RBD_POOL_NAME
+eof
+  else
+    echo "radosnamespace $RADOS_NAMESPACE already exists"
+  fi
+}
+
+function createSubvolumeGroupCR() {
+  if ! $KUBECTL -n "$NAMESPACE" get CephFilesystemSubVolumeGroup $SUBVOLUME_GROUP &>/dev/null; then
+    cat <<eof | $KUBECTL create -f -
+---
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystemSubVolumeGroup
+metadata:
+  name: $SUBVOLUME_GROUP
+  namespace: $NAMESPACE # namespace:cluster
+spec:
+  # filesystemName is the metadata name of the CephFilesystem CR where the subvolume group will be created
+  filesystemName: $CEPHFS_FS_NAME
+eof
+  else
+    echo "subvolumegroup $SUBVOLUME_GROUP already exists"
+  fi
+}
+
 function importClusterID() {
   if [ -n "$RADOS_NAMESPACE" ]; then
-    CLUSTER_ID_RBD=$(kubectl -n "$NAMESPACE" get cephblockpoolradosnamespace.ceph.rook.io/"$RADOS_NAMESPACE" -o jsonpath='{.status.info.clusterID}')
+    createRadosNamespaceCR
+    timeout 20 sh -c "until [ $($KUBECTL -n "$NAMESPACE" get CephBlockPoolRadosNamespace/"$RADOS_NAMESPACE" -o jsonpath='{.status.phase}' | grep -c "Ready") -eq 1 ]; do echo "waiting for radosNamespace to get created" && sleep 1; done"
+    CLUSTER_ID_RBD=$($KUBECTL -n "$NAMESPACE" get cephblockpoolradosnamespace.ceph.rook.io/"$RADOS_NAMESPACE" -o jsonpath='{.status.info.clusterID}')
+    RBD_STORAGE_CLASS_NAME=ceph-rbd-$RADOS_NAMESPACE
   fi
   if [ -n "$SUBVOLUME_GROUP" ]; then
-    CLUSTER_ID_CEPHFS=$(kubectl -n "$NAMESPACE" get cephfilesystemsubvolumegroup.ceph.rook.io/"$SUBVOLUME_GROUP" -o jsonpath='{.status.info.clusterID}')
+    createSubvolumeGroupCR
+    timeout 20 sh -c "until [ $($KUBECTL -n "$NAMESPACE" get CephFilesystemSubVolumeGroup/"$SUBVOLUME_GROUP" -o jsonpath='{.status.phase}' | grep -c "Ready") -eq 1 ]; do echo "waiting for radosNamespace to get created" && sleep 1; done"
+    CLUSTER_ID_CEPHFS=$($KUBECTL -n "$NAMESPACE" get cephfilesystemsubvolumegroup.ceph.rook.io/"$SUBVOLUME_GROUP" -o jsonpath='{.status.info.clusterID}')
+    CEPHFS_STORAGE_CLASS_NAME=cephfs-$SUBVOLUME_GROUP
   fi
 }
 
 function importSecret() {
-  if ! kubectl -n "$NAMESPACE" get secret "$MON_SECRET_NAME" &>/dev/null; then
-    kubectl -n "$NAMESPACE" \
+  if ! $KUBECTL -n "$NAMESPACE" get secret "$MON_SECRET_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
       create \
       secret \
       generic \
@@ -107,8 +157,8 @@ function importSecret() {
 }
 
 function importConfigMap() {
-  if ! kubectl -n "$NAMESPACE" get configmap "$MON_ENDPOINT_CONFIGMAP_NAME" &>/dev/null; then
-    kubectl -n "$NAMESPACE" \
+  if ! $KUBECTL -n "$NAMESPACE" get configmap "$MON_ENDPOINT_CONFIGMAP_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
       create \
       configmap \
       "$MON_ENDPOINT_CONFIGMAP_NAME" \
@@ -120,9 +170,26 @@ function importConfigMap() {
   fi
 }
 
+function createInputCommadConfigMap() {
+  if ! $KUBECTL -n "$NAMESPACE" get configmap "$EXTERNAL_COMMAND_CONFIGMAP_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
+      create \
+      configmap \
+      "$EXTERNAL_COMMAND_CONFIGMAP_NAME" \
+      --from-literal=args="$ARGS"
+  else
+    echo "configmap $EXTERNAL_COMMAND_CONFIGMAP_NAME already exists, updating it"
+    $KUBECTL -n "$NAMESPACE" \
+      patch \
+      configmap \
+      "$EXTERNAL_COMMAND_CONFIGMAP_NAME" \
+      -p "$(jq -n --arg args "$ARGS" '{"data": {"args": $args}}')"
+  fi
+}
+
 function importCsiRBDNodeSecret() {
-  if ! kubectl -n "$NAMESPACE" get secret "rook-$CSI_RBD_NODE_SECRET_NAME" &>/dev/null; then
-    kubectl -n "$NAMESPACE" \
+  if ! $KUBECTL -n "$NAMESPACE" get secret "rook-$CSI_RBD_NODE_SECRET_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
       create \
       secret \
       generic \
@@ -136,8 +203,8 @@ function importCsiRBDNodeSecret() {
 }
 
 function importCsiRBDProvisionerSecret() {
-  if ! kubectl -n "$NAMESPACE" get secret "rook-$CSI_RBD_PROVISIONER_SECRET_NAME" &>/dev/null; then
-    kubectl -n "$NAMESPACE" \
+  if ! $KUBECTL -n "$NAMESPACE" get secret "rook-$CSI_RBD_PROVISIONER_SECRET_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
       create \
       secret \
       generic \
@@ -151,8 +218,8 @@ function importCsiRBDProvisionerSecret() {
 }
 
 function importCsiCephFSNodeSecret() {
-  if ! kubectl -n "$NAMESPACE" get secret "rook-$CSI_CEPHFS_NODE_SECRET_NAME" &>/dev/null; then
-    kubectl -n "$NAMESPACE" \
+  if ! $KUBECTL -n "$NAMESPACE" get secret "rook-$CSI_CEPHFS_NODE_SECRET_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
       create \
       secret \
       generic \
@@ -166,8 +233,8 @@ function importCsiCephFSNodeSecret() {
 }
 
 function importCsiCephFSProvisionerSecret() {
-  if ! kubectl -n "$NAMESPACE" get secret "rook-$CSI_CEPHFS_PROVISIONER_SECRET_NAME" &>/dev/null; then
-    kubectl -n "$NAMESPACE" \
+  if ! $KUBECTL -n "$NAMESPACE" get secret "rook-$CSI_CEPHFS_PROVISIONER_SECRET_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
       create \
       secret \
       generic \
@@ -181,8 +248,8 @@ function importCsiCephFSProvisionerSecret() {
 }
 
 function importRGWAdminOpsUser() {
-  if ! kubectl -n "$NAMESPACE" get secret "$RGW_ADMIN_OPS_USER_SECRET_NAME" &>/dev/null; then
-    kubectl -n "$NAMESPACE" \
+  if ! $KUBECTL -n "$NAMESPACE" get secret "$RGW_ADMIN_OPS_USER_SECRET_NAME" &>/dev/null; then
+    $KUBECTL -n "$NAMESPACE" \
       create \
       secret \
       generic \
@@ -196,8 +263,8 @@ function importRGWAdminOpsUser() {
 }
 
 function createECRBDStorageClass() {
-  if ! kubectl -n "$NAMESPACE" get storageclass $RBD_STORAGE_CLASS_NAME &>/dev/null; then
-    cat <<eof | kubectl create -f -
+  if ! $KUBECTL -n "$NAMESPACE" get storageclass $RBD_STORAGE_CLASS_NAME &>/dev/null; then
+    cat <<eof | $KUBECTL create -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -225,8 +292,8 @@ eof
 }
 
 function createRBDStorageClass() {
-  if ! kubectl -n "$NAMESPACE" get storageclass $RBD_STORAGE_CLASS_NAME &>/dev/null; then
-    cat <<eof | kubectl create -f -
+  if ! $KUBECTL -n "$NAMESPACE" get storageclass $RBD_STORAGE_CLASS_NAME &>/dev/null; then
+    cat <<eof | $KUBECTL create -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -252,9 +319,65 @@ eof
   fi
 }
 
-function createCephFSStorageClass() {
-  if ! kubectl -n "$NAMESPACE" get storageclass $CEPHFS_STORAGE_CLASS_NAME &>/dev/null; then
+function getTopologyTemplate() {
+  topology=$(
+    cat <<-END
+     {"poolName":"$1",
+      "domainSegments":[
+        {"domainLabel":"$2","value":"$3"}]},
+END
+  )
+}
+
+function createTopology() {
+  TOPOLOGY=""
+  declare -a topology_failure_domain_values_array=()
+  declare -a topology_pools_array=()
+  topology_pools=("$(echo "$TOPOLOGY_POOLS" | tr "," "\n")")
+  for i in ${topology_pools[0]}; do topology_pools_array+=("$i"); done
+  topology_failure_domain_values=("$(echo "$TOPOLOGY_FAILURE_DOMAIN_VALUES" | tr "," "\n")")
+  for i in ${topology_failure_domain_values[0]}; do topology_failure_domain_values_array+=("$i"); done
+  for ((i = 0; i < ${#topology_failure_domain_values_array[@]}; i++)); do
+    getTopologyTemplate "${topology_pools_array[$i]}" "$TOPOLOGY_FAILURE_DOMAIN_LABEL" "${topology_failure_domain_values_array[$i]}"
+    TOPOLOGY="$TOPOLOGY"$'\n'"$topology"
+    topology=""
+  done
+}
+
+function createRBDTopologyStorageClass() {
+  if ! kubectl -n "$NAMESPACE" get storageclass $RBD_TOPOLOGY_STORAGE_CLASS_NAME &>/dev/null; then
     cat <<eof | kubectl create -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: $RBD_TOPOLOGY_STORAGE_CLASS_NAME
+provisioner: $RBD_PROVISIONER
+parameters:
+  clusterID: $CLUSTER_ID_RBD
+  imageFormat: "2"
+  imageFeatures: $ROOK_RBD_FEATURES
+  topologyConstrainedPools: |
+    [$TOPOLOGY
+    ]
+  csi.storage.k8s.io/provisioner-secret-name: "rook-$CSI_RBD_PROVISIONER_SECRET_NAME"
+  csi.storage.k8s.io/provisioner-secret-namespace: $NAMESPACE
+  csi.storage.k8s.io/controller-expand-secret-name:  "rook-$CSI_RBD_PROVISIONER_SECRET_NAME"
+  csi.storage.k8s.io/controller-expand-secret-namespace: $NAMESPACE
+  csi.storage.k8s.io/node-stage-secret-name: "rook-$CSI_RBD_NODE_SECRET_NAME"
+  csi.storage.k8s.io/node-stage-secret-namespace: $NAMESPACE
+  csi.storage.k8s.io/fstype: ext4
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+eof
+  else
+    echo "storageclass $RBD_TOPOLOGY_STORAGE_CLASS_NAME already exists"
+  fi
+}
+
+function createCephFSStorageClass() {
+  if ! $KUBECTL -n "$NAMESPACE" get storageclass $CEPHFS_STORAGE_CLASS_NAME &>/dev/null; then
+    cat <<eof | $KUBECTL create -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -286,6 +409,7 @@ createClusterNamespace
 importClusterID
 importSecret
 importConfigMap
+createInputCommadConfigMap
 if [ -n "$CSI_RBD_NODE_SECRET_NAME" ] && [ -n "$CSI_RBD_NODE_SECRET" ]; then
   importCsiRBDNodeSecret
 fi
@@ -310,4 +434,8 @@ if [ -n "$RBD_POOL_NAME" ]; then
 fi
 if [ -n "$CEPHFS_FS_NAME" ] && [ -n "$CEPHFS_POOL_NAME" ]; then
   createCephFSStorageClass
+fi
+if [ -n "$TOPOLOGY_POOLS" ] && [ -n "$TOPOLOGY_FAILURE_DOMAIN_LABEL" ] && [ -n "$TOPOLOGY_FAILURE_DOMAIN_VALUES" ]; then
+  createTopology
+  createRBDTopologyStorageClass
 fi

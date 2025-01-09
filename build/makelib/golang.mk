@@ -48,7 +48,7 @@ GO_TEST_FLAGS ?=
 # ====================================================================================
 # Setup go environment
 
-GO_SUPPORTED_VERSIONS ?= 1.21|1.20
+GO_SUPPORTED_VERSIONS ?= 1.22|1.23
 
 GO_PACKAGES := $(foreach t,$(GO_SUBDIRS),$(GO_PROJECT)/$(t)/...)
 GO_INTEGRATION_TEST_PACKAGES := $(foreach t,$(GO_INTEGRATION_TESTS_SUBDIRS),$(GO_PROJECT)/$(t)/integration)
@@ -132,8 +132,8 @@ go.test.unit:
 	@$(MAKE) $(GOJUNIT)
 	@echo === go test unit-tests
 	@mkdir -p $(GO_TEST_OUTPUT)
-	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GOHOST) test -v -cover $(GO_STATIC_FLAGS) $(GO_PACKAGES)
-	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GOHOST) test -v -cover $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_PACKAGES) 2>&1 | tee $(GO_TEST_OUTPUT)/unit-tests.log
+	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GO) test -v -cover $(GO_STATIC_FLAGS) $(GO_PACKAGES)
+	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GO) test -v -cover $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_PACKAGES) 2>&1 | tee $(GO_TEST_OUTPUT)/unit-tests.log
 	@cat $(GO_TEST_OUTPUT)/unit-tests.log | $(GOJUNIT) -set-exit-code > $(GO_TEST_OUTPUT)/unit-tests.xml
 
 .PHONY:
@@ -201,7 +201,7 @@ $(GOFMT):
 $(GOJUNIT):
 	@echo === installing go-junit-report
 	@mkdir -p $(TOOLS_DIR)/tmp
-	@curl -sL https://github.com/jstemmer/go-junit-report/releases/download/v2.0.0/go-junit-report-v2.0.0-$(GOOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_DIR)/tmp
+	@curl -sL https://github.com/jstemmer/go-junit-report/releases/download/v2.1.0/go-junit-report-v2.1.0-$(GOOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_DIR)/tmp
 	@mv $(TOOLS_DIR)/tmp/go-junit-report $(TOOLS_DIR)
 	@rm -fr $(TOOLS_DIR)/tmp
 
@@ -231,7 +231,7 @@ $(YQ):
 	@curl -JL https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(REAL_HOST_PLATFORM) -o $(YQ)
 	@chmod +x $(YQ)
 
-export CODE_GENERATOR_VERSION=0.20.0
+export CODE_GENERATOR_VERSION=0.31.3
 export CODE_GENERATOR=$(TOOLS_HOST_DIR)/code-generator-$(CODE_GENERATOR_VERSION)
 $(CODE_GENERATOR):
 	mkdir -p $(TOOLS_HOST_DIR)

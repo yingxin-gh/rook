@@ -18,10 +18,7 @@ limitations under the License.
 package object
 
 import (
-	"bytes"
 	"context"
-	"io"
-	"net/http"
 	"os"
 	"reflect"
 	"testing"
@@ -29,7 +26,6 @@ import (
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
-	"github.com/ceph/go-ceph/rgw/admin"
 	"github.com/coreos/pkg/capnslog"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
@@ -149,9 +145,10 @@ const (
 	dummyVersionsRaw          = `
 	{
 		"mon": {
-			"ceph version 17.2.1 (0000000000000000) quincy (stable)": 3
+			"ceph version 19.2.1 (0000000000000000) squid (stable)": 3
 		}
 	}`
+	//nolint:gosec // only test values, not a real secret
 	userCreateJSON = `{
 	"user_id": "my-user",
 	"display_name": "my-user",
@@ -324,35 +321,6 @@ var (
 	store     = "my-store"
 )
 
-var mockMultisiteAdminOpsCtxFunc = func(objContext *Context, spec *cephv1.ObjectStoreSpec) (*AdminOpsContext, error) {
-	mockClient := &MockClient{
-		MockDo: func(req *http.Request) (*http.Response, error) {
-			if req.Method == http.MethodGet || req.Method == http.MethodPut {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
-				}, nil
-			}
-			if req.Method == http.MethodDelete {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte(""))),
-				}, nil
-			}
-			return nil, errors.Errorf("unexpected method %q", req.Method)
-		},
-	}
-	context := NewContext(objContext.Context, objContext.clusterInfo, store)
-	adminClient, _ := admin.New("rook-ceph-rgw-my-store.mycluster.svc", "53S6B9S809NUP19IJ2K3", "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", mockClient)
-
-	return &AdminOpsContext{
-		Context:               *context,
-		AdminOpsUserAccessKey: "EOE7FYCNOBZJ5VFV909G",
-		AdminOpsUserSecretKey: "qmIqpWm8HxCzmynCrD6U6vKWi4hnDBndOnmxXNsV", // notsecret
-		AdminOpsClient:        adminClient,
-	}, nil
-}
-
 func TestCephObjectStoreController(t *testing.T) {
 	ctx := context.TODO()
 	// Set DEBUG logging
@@ -368,13 +336,6 @@ func TestCephObjectStoreController(t *testing.T) {
 		calledCommitConfigChanges = true
 		return nil
 	}
-
-	// overwrite adminops context func
-	oldNewMultisiteAdminOpsCtxFunc := newMultisiteAdminOpsCtxFunc
-	newMultisiteAdminOpsCtxFunc = mockMultisiteAdminOpsCtxFunc
-	defer func() {
-		newMultisiteAdminOpsCtxFunc = oldNewMultisiteAdminOpsCtxFunc
-	}()
 
 	setupNewEnvironment := func(additionalObjects ...runtime.Object) *ReconcileCephObjectStore {
 		// reset var we use to check if we have called to commit config changes
@@ -417,11 +378,9 @@ func TestCephObjectStoreController(t *testing.T) {
 		s := scheme.Scheme
 		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStore{})
 		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{})
-		s.AddKnownTypes(v1.SchemeGroupVersion, &v1.Secret{})
 
 		// Create a fake client to mock API calls.
 		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
-
 		// Create a ReconcileCephObjectStore object with the scheme and fake client.
 		r := &ReconcileCephObjectStore{
 			client:           cl,
@@ -530,7 +489,7 @@ func TestCephObjectStoreController(t *testing.T) {
 					// ceph actually outputs this all on one line, but this parses the same
 					return `[
 						{"poolnum":1,"poolname":"replicapool"},
-						{"poolnum":2,"poolname":"device_health_metrics"},
+						{"poolnum":2,"poolname":".mgr"},
 						{"poolnum":3,"poolname":".rgw.root"},
 						{"poolnum":4,"poolname":"my-store.rgw.buckets.index"},
 						{"poolnum":5,"poolname":"my-store.rgw.buckets.non-ec"},
@@ -540,6 +499,13 @@ func TestCephObjectStoreController(t *testing.T) {
 						{"poolnum":9,"poolname":"my-store.rgw.buckets.data"}
 					]`, nil
 				}
+				if args[0] == "mirror" && args[2] == "info" {
+					return "{}", nil
+				}
+				if args[0] == "mirror" && args[2] == "disable" {
+					return "", nil
+				}
+
 				return "", nil
 			},
 			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
@@ -730,12 +696,7 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 
 	commitConfigChangesOrig := commitConfigChanges
 	defer func() { commitConfigChanges = commitConfigChangesOrig }()
-	// overwrite adminops context func
-	oldNewMultisiteAdminOpsCtxFunc := newMultisiteAdminOpsCtxFunc
-	newMultisiteAdminOpsCtxFunc = mockMultisiteAdminOpsCtxFunc
-	defer func() {
-		newMultisiteAdminOpsCtxFunc = oldNewMultisiteAdminOpsCtxFunc
-	}()
+
 	// make sure joining multisite calls to commit config changes
 	calledCommitConfigChanges := false
 	commitConfigChanges = func(c *Context) error {
@@ -758,7 +719,7 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 	// Register operator types with the runtime scheme.
 	s := scheme.Scheme
 	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectZone{}, &cephv1.CephObjectZoneList{}, &cephv1.CephCluster{}, &cephv1.CephClusterList{}, &cephv1.CephObjectStore{}, &cephv1.CephObjectStoreList{})
-	s.AddKnownTypes(v1.SchemeGroupVersion, &v1.Secret{})
+
 	// Create a fake client to mock API calls.
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
@@ -963,13 +924,6 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 			rgwAdminOpsUserSecret,
 		}
 
-		// overwrite adminops context func
-		oldNewMultisiteAdminOpsCtxFunc := newMultisiteAdminOpsCtxFunc
-		newMultisiteAdminOpsCtxFunc = mockMultisiteAdminOpsCtxFunc
-		defer func() {
-			newMultisiteAdminOpsCtxFunc = oldNewMultisiteAdminOpsCtxFunc
-		}()
-
 		r := getReconciler(objects)
 
 		t.Run("create an external object store", func(t *testing.T) {
@@ -1041,22 +995,22 @@ func TestDiffVersions(t *testing.T) {
 			if args[0] == "versions" {
 				return `{
     "mon": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 3
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 3
     },
     "mgr": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 1
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 1
     },
     "osd": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 3
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 3
     },
     "mds": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 2
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 2
     },
     "rgw": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 1
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 1
     },
     "overall": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 10
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 10
     }
 }`, nil
 			}
@@ -1066,7 +1020,7 @@ func TestDiffVersions(t *testing.T) {
 	c := &clusterd.Context{Executor: executor}
 
 	// desiredCephVersion comes from DetectCephVersion() (ceph --version) which uses ExtractCephVersion()
-	desiredCephVersion, err := cephver.ExtractCephVersion("ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)")
+	desiredCephVersion, err := cephver.ExtractCephVersion("ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)")
 	assert.NoError(t, err)
 
 	// runningCephVersion comes from LeastUptodateDaemonVersion()

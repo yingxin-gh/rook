@@ -470,7 +470,7 @@ func testOSDIntegration(t *testing.T) {
 			Name:                 "new",
 			Count:                3,
 			Portable:             true,
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
+			VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{},
 		}
 		cephCluster.Spec.Storage.StorageClassDeviceSets = append(cephCluster.Spec.Storage.StorageClassDeviceSets, newSCDS)
 
@@ -487,7 +487,7 @@ func testOSDIntegration(t *testing.T) {
 		assert.Len(t, deploymentsCreated, 0)
 		assert.Len(t, deploymentsUpdated, 34)
 
-		cephCluster.Spec.Storage.StorageClassDeviceSets[2].VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
+		cephCluster.Spec.Storage.StorageClassDeviceSets[2].VolumeClaimTemplates = []cephv1.VolumeClaimTemplate{
 			newDummyPVC("data", namespace, "100Gi", "ec2"),
 			newDummyPVC("metadata", namespace, "10Gi", "uncle-rogers-secret-stuff"),
 		}
@@ -585,10 +585,13 @@ func osdIntegrationTestExecutor(t *testing.T, clientset *fake.Clientset, namespa
 						return `["ssd"]`, nil
 					}
 				}
+				if args[1] == "df" {
+					return osdDFResults, nil
+				}
 			}
 			if args[0] == "versions" {
 				// the update deploy code only cares about the mons from the ceph version command results
-				v := `{"mon":{"ceph version 17.2.1 (somehash) quincy (stable)":3}}`
+				v := `{"mon":{"ceph version 19.2.1 (somehash) squid (stable)":3}}`
 				return v, nil
 			}
 			return "", errors.Errorf("unexpected ceph command %q", args)
@@ -631,7 +634,7 @@ func newDummyStorageClassDeviceSet(
 		Name:     name,
 		Count:    count,
 		Portable: portable,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{
 			newDummyPVC("data", namespace, "10Gi", storageClassName),
 		},
 	}

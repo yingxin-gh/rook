@@ -57,6 +57,8 @@ func (h *CephInstaller) configureRookOperatorViaHelm(upgrade bool) error {
 		"enableDiscoveryDaemon": h.settings.EnableDiscovery,
 		"image":                 map[string]interface{}{"tag": h.settings.RookVersion},
 		"monitoring":            map[string]interface{}{"enabled": true},
+		"revisionHistoryLimit":  "3",
+		"enforceHostNetwork":    "false",
 	}
 	values["csi"] = map[string]interface{}{
 		"csiRBDProvisionerResource":    nil,
@@ -65,13 +67,11 @@ func (h *CephInstaller) configureRookOperatorViaHelm(upgrade bool) error {
 		"csiCephFSPluginResource":      nil,
 	}
 
-	// create the operator namespace before the admission controller is created
+	// create the operator namespace
 	if err := h.k8shelper.CreateNamespace(h.settings.OperatorNamespace); err != nil {
 		return errors.Errorf("failed to create namespace %s. %v", h.settings.Namespace, err)
 	}
-	if err := h.startAdmissionController(); err != nil {
-		return errors.Errorf("failed to start admission controllers. %v", err)
-	}
+
 	if h.settings.RookVersion == LocalBuildTag {
 		if err := h.helmHelper.InstallLocalHelmChart(upgrade, h.settings.OperatorNamespace, OperatorChartName, values); err != nil {
 			return errors.Errorf("failed to install rook operator via helm, err : %v", err)
@@ -173,6 +173,9 @@ func (h *CephInstaller) removeCephClusterHelmResources() {
 		assert.True(h.T(), kerrors.IsNotFound(err))
 	}
 	if err := h.k8shelper.RookClientset.CephV1().CephBlockPools(h.settings.Namespace).Delete(context.TODO(), BlockPoolName, v1.DeleteOptions{}); err != nil {
+		assert.True(h.T(), kerrors.IsNotFound(err))
+	}
+	if err := h.k8shelper.RookClientset.CephV1().CephFilesystemSubVolumeGroups(h.settings.Namespace).Delete(context.TODO(), FilesystemName+"-csi", v1.DeleteOptions{}); err != nil {
 		assert.True(h.T(), kerrors.IsNotFound(err))
 	}
 	if err := h.k8shelper.RookClientset.CephV1().CephFilesystems(h.settings.Namespace).Delete(context.TODO(), FilesystemName, v1.DeleteOptions{}); err != nil {
@@ -281,7 +284,7 @@ func (h *CephInstaller) CreateFileSystemConfiguration(values map[string]interfac
 
 // CreateObjectStoreConfiguration creates an object store configuration
 func (h *CephInstaller) CreateObjectStoreConfiguration(values map[string]interface{}, name, scName string) error {
-	testObjectStoreBytes := []byte(h.Manifests.GetObjectStore(name, 2, 8080, false))
+	testObjectStoreBytes := []byte(h.Manifests.GetObjectStore(name, 2, 8080, false, false))
 	var testObjectStoreCRD map[string]interface{}
 	if err := yaml.Unmarshal(testObjectStoreBytes, &testObjectStoreCRD); err != nil {
 		return err

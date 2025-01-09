@@ -30,6 +30,7 @@ import (
 	"github.com/rook/rook/pkg/operator/ceph/cluster/osd"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/rbd"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/file/mds"
 	"github.com/rook/rook/pkg/operator/ceph/file/mirror"
 	"github.com/rook/rook/pkg/operator/ceph/object"
@@ -138,7 +139,7 @@ func (c *ClusterController) cleanUpJobContainer(cluster *cephv1.CephCluster, mon
 		SecurityContext: securityContext,
 		VolumeMounts:    volumeMounts,
 		Env:             envVars,
-		Args:            []string{"ceph", "clean"},
+		Args:            []string{"ceph", "clean", "host"},
 		Resources:       cephv1.GetCleanupResources(cluster.Spec.Resources),
 	}
 }
@@ -158,9 +159,12 @@ func (c *ClusterController) cleanUpJobTemplateSpec(cluster *cephv1.CephCluster, 
 			Containers: []v1.Container{
 				c.cleanUpJobContainer(cluster, monSecret, clusterFSID),
 			},
-			Volumes:           volumes,
-			RestartPolicy:     v1.RestartPolicyOnFailure,
-			PriorityClassName: cephv1.GetCleanupPriorityClassName(cluster.Spec.PriorityClassNames),
+			Volumes:            volumes,
+			RestartPolicy:      v1.RestartPolicyOnFailure,
+			PriorityClassName:  cephv1.GetCleanupPriorityClassName(cluster.Spec.PriorityClassNames),
+			SecurityContext:    &v1.PodSecurityContext{},
+			ServiceAccountName: k8sutil.DefaultServiceAccount,
+			HostNetwork:        opcontroller.EnforceHostNetwork(),
 		},
 	}
 

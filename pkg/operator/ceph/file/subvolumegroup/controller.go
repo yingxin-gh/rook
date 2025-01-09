@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	csiopv1a1 "github.com/ceph/ceph-csi-operator/api/v1alpha1"
 	"github.com/pkg/errors"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/util/exec"
@@ -40,12 +41,15 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/csi"
+	"github.com/rook/rook/pkg/operator/ceph/file"
 	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
+	cephcsi "github.com/ceph/ceph-csi/api/deploy/kubernetes"
 )
 
 const (
@@ -98,7 +102,12 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	logger.Info("successfully started")
 
 	// Watch for changes on the CephFilesystemSubVolumeGroup CRD object
-	err = c.Watch(source.Kind(mgr.GetCache(), &cephv1.CephFilesystemSubVolumeGroup{TypeMeta: controllerTypeMeta}), &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = c.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephFilesystemSubVolumeGroup{TypeMeta: controllerTypeMeta}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate()))
+	if err != nil {
+		return err
+	}
+
+	err = csiopv1a1.AddToScheme(mgr.GetScheme())
 	if err != nil {
 		return err
 	}
@@ -185,7 +194,7 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) reconcile(request reconcile.Requ
 		if cephCluster.Spec.External.Enable {
 			logger.Warningf("external subvolume group %q deletion is not supported, delete it manually", namespacedName)
 		} else {
-			err := r.deleteSubVolumeGroup(cephFilesystemSubVolumeGroup)
+			err = r.deleteSubVolumeGroup(cephFilesystemSubVolumeGroup, &cephCluster)
 			if err != nil {
 				if strings.Contains(err.Error(), opcontroller.UninitializedCephConfigError) {
 					logger.Info(opcontroller.OperatorNotInitializedMessage)
@@ -195,7 +204,7 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) reconcile(request reconcile.Requ
 			}
 		}
 
-		err = csi.SaveClusterConfig(r.context.Clientset, buildClusterID(cephFilesystemSubVolumeGroup), r.clusterInfo, nil)
+		err = csi.SaveClusterConfig(r.context.Clientset, buildClusterID(cephFilesystemSubVolumeGroup), cephCluster.Namespace, r.clusterInfo, nil)
 		if err != nil {
 			return reconcile.Result{}, errors.Wrap(err, "failed to save cluster config")
 		}
@@ -255,7 +264,21 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) reconcile(request reconcile.Requ
 	if err != nil {
 		return reconcile.Result{}, errors.Wrap(err, "failed to save cluster config")
 	}
+
+	err = cephclient.PinCephFSSubVolumeGroup(r.context, r.clusterInfo, cephFilesystemSubVolumeGroup.Spec.FilesystemName, cephFilesystemSubVolumeGroup, getSubvolumeGroupName(cephFilesystemSubVolumeGroup))
+	if err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to pin filesystem subvolume group %q", cephFilesystemSubVolumeGroup.Name)
+	}
+
 	r.updateStatus(observedGeneration, request.NamespacedName, cephv1.ConditionReady)
+
+	if csi.EnableCSIOperator() {
+		err = csi.CreateUpdateClientProfileSubVolumeGroup(r.clusterInfo.Context, r.client, r.clusterInfo, cephFilesystemNamespacedName, buildClusterID(cephFilesystemSubVolumeGroup), cephCluster.Name)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrap(err, "failed to create ceph csi-op config CR for subVolGrp ns")
+		}
+	}
+
 	// Return and do not requeue
 	logger.Debugf("done reconciling cephFilesystemSubVolumeGroup %q", namespacedName)
 	return reconcile.Result{}, nil
@@ -272,28 +295,25 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) updateClusterConfig(cephFilesyst
 	// Update CSI config map
 	// If the mon endpoints change, the mon health check go routine will take care of updating the
 	// config map, so no special care is needed in this controller
-	csiClusterConfigEntry := csi.CsiClusterConfigEntry{
+	csiClusterConfigEntry := csi.CSIClusterConfigEntry{
 		Namespace: r.clusterInfo.Namespace,
-		Monitors:  csi.MonEndpoints(r.clusterInfo.Monitors, cephCluster.Spec.RequireMsgr2()),
-		CephFS: &csi.CsiCephFSSpec{
-			SubvolumeGroup:     getSubvolumeGroupName(cephFilesystemSubVolumeGroup),
-			KernelMountOptions: r.clusterInfo.CSIDriverSpec.CephFS.KernelMountOptions,
-			FuseMountOptions:   r.clusterInfo.CSIDriverSpec.CephFS.FuseMountOptions,
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: csi.MonEndpoints(r.clusterInfo.Monitors, cephCluster.Spec.RequireMsgr2()),
+			CephFS: cephcsi.CephFS{
+				SubvolumeGroup:     getSubvolumeGroupName(cephFilesystemSubVolumeGroup),
+				KernelMountOptions: r.clusterInfo.CSIDriverSpec.CephFS.KernelMountOptions,
+				FuseMountOptions:   r.clusterInfo.CSIDriverSpec.CephFS.FuseMountOptions,
+			},
+			ReadAffinity: cephcsi.ReadAffinity{
+				Enabled:             r.clusterInfo.CSIDriverSpec.ReadAffinity.Enabled,
+				CrushLocationLabels: r.clusterInfo.CSIDriverSpec.ReadAffinity.CrushLocationLabels,
+			},
 		},
-		ReadAffinity: &r.clusterInfo.CSIDriverSpec.ReadAffinity,
 	}
 
-	// If the cluster has Multus enabled we need to append the network namespace of the driver's
-	// holder DaemonSet in the csi configmap
-	if cephCluster.Spec.Network.IsMultus() {
-		netNamespaceFilePath, err := csi.GenerateNetNamespaceFilePath(r.opManagerContext, r.client, cephCluster.Name, r.opConfig.OperatorNamespace, csi.CephFSDriverShortName)
-		if err != nil {
-			return errors.Wrap(err, "failed to generate cephfs net namespace file path")
-		}
-		csiClusterConfigEntry.CephFS.NetNamespaceFilePath = netNamespaceFilePath
-	}
+	csiClusterConfigEntry.CephFS.NetNamespaceFilePath = ""
 
-	err := csi.SaveClusterConfig(r.context.Clientset, buildClusterID(cephFilesystemSubVolumeGroup), r.clusterInfo, &csiClusterConfigEntry)
+	err := csi.SaveClusterConfig(r.context.Clientset, buildClusterID(cephFilesystemSubVolumeGroup), cephCluster.Namespace, r.clusterInfo, &csiClusterConfigEntry)
 	if err != nil {
 		return errors.Wrap(err, "failed to save cluster config")
 	}
@@ -304,7 +324,7 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) updateClusterConfig(cephFilesyst
 func (r *ReconcileCephFilesystemSubVolumeGroup) createOrUpdateSubVolumeGroup(cephFilesystemSubVolumeGroup *cephv1.CephFilesystemSubVolumeGroup) error {
 	logger.Infof("creating ceph filesystem subvolume group %s in namespace %s", cephFilesystemSubVolumeGroup.Name, cephFilesystemSubVolumeGroup.Namespace)
 
-	err := cephclient.CreateCephFSSubVolumeGroup(r.context, r.clusterInfo, cephFilesystemSubVolumeGroup.Spec.FilesystemName, getSubvolumeGroupName(cephFilesystemSubVolumeGroup))
+	err := cephclient.CreateCephFSSubVolumeGroup(r.context, r.clusterInfo, cephFilesystemSubVolumeGroup.Spec.FilesystemName, getSubvolumeGroupName(cephFilesystemSubVolumeGroup), &cephFilesystemSubVolumeGroup.Spec)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create ceph filesystem subvolume group %q", cephFilesystemSubVolumeGroup.Name)
 	}
@@ -313,7 +333,8 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) createOrUpdateSubVolumeGroup(cep
 }
 
 // Delete the ceph filesystem subvolume group
-func (r *ReconcileCephFilesystemSubVolumeGroup) deleteSubVolumeGroup(cephFilesystemSubVolumeGroup *cephv1.CephFilesystemSubVolumeGroup) error {
+func (r *ReconcileCephFilesystemSubVolumeGroup) deleteSubVolumeGroup(cephFilesystemSubVolumeGroup *cephv1.CephFilesystemSubVolumeGroup,
+	cephCluster *cephv1.CephCluster) error {
 	namespacedName := fmt.Sprintf("%s/%s", cephFilesystemSubVolumeGroup.Namespace, cephFilesystemSubVolumeGroup.Name)
 	logger.Infof("deleting ceph filesystem subvolume group object %q", namespacedName)
 	if err := cephclient.DeleteCephFSSubVolumeGroup(r.context, r.clusterInfo, cephFilesystemSubVolumeGroup.Spec.FilesystemName, getSubvolumeGroupName(cephFilesystemSubVolumeGroup)); err != nil {
@@ -326,7 +347,17 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) deleteSubVolumeGroup(cephFilesys
 		// If the subvolume group has subvolumes the command will fail with:
 		// Error ENOTEMPTY: error in rmdir /volumes/csi
 		if ok && (code == int(syscall.ENOTEMPTY)) {
-			return errors.Wrapf(err, "failed to delete ceph filesystem subvolume group %q, remove the subvolumes first", cephFilesystemSubVolumeGroup.Name)
+			msg := fmt.Sprintf("failed to delete ceph filesystem subvolume group %q, remove the subvolumes first", cephFilesystemSubVolumeGroup.Name)
+			if opcontroller.ForceDeleteRequested(cephFilesystemSubVolumeGroup.GetAnnotations()) {
+				// cleanup cephFS subvolumes
+				cleanupErr := r.cleanup(cephFilesystemSubVolumeGroup, cephCluster)
+				if cleanupErr != nil {
+					return errors.Wrapf(cleanupErr, "failed to clean up all the ceph resources created by subVolumeGroup %q", namespacedName)
+				}
+				msg = fmt.Sprintf("failed to delete ceph filesystem subvolume group %q, started clean up job to delete the subvolumes", cephFilesystemSubVolumeGroup.Name)
+			}
+
+			return errors.Wrapf(err, "%s", msg)
 		}
 
 		return errors.Wrapf(err, "failed to delete ceph filesystem subvolume group %q", cephFilesystemSubVolumeGroup.Name)
@@ -352,7 +383,11 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) updateStatus(observedGeneration 
 	}
 
 	cephFilesystemSubVolumeGroup.Status.Phase = status
-	cephFilesystemSubVolumeGroup.Status.Info = map[string]string{"clusterID": buildClusterID(cephFilesystemSubVolumeGroup)}
+	cephFilesystemSubVolumeGroup.Status.Info = map[string]string{
+		"clusterID": buildClusterID(cephFilesystemSubVolumeGroup),
+		"pinning":   formatPinning(cephFilesystemSubVolumeGroup.Spec.Pinning),
+	}
+
 	if observedGeneration != k8sutil.ObservedGenerationNotAvailable {
 		cephFilesystemSubVolumeGroup.Status.ObservedGeneration = observedGeneration
 	}
@@ -366,4 +401,42 @@ func (r *ReconcileCephFilesystemSubVolumeGroup) updateStatus(observedGeneration 
 func buildClusterID(cephFilesystemSubVolumeGroup *cephv1.CephFilesystemSubVolumeGroup) string {
 	clusterID := fmt.Sprintf("%s-%s-file-%s", cephFilesystemSubVolumeGroup.Namespace, cephFilesystemSubVolumeGroup.Spec.FilesystemName, getSubvolumeGroupName(cephFilesystemSubVolumeGroup))
 	return k8sutil.Hash(clusterID)
+}
+
+func (r *ReconcileCephFilesystemSubVolumeGroup) cleanup(svg *cephv1.CephFilesystemSubVolumeGroup, cephCluster *cephv1.CephCluster) error {
+	logger.Infof("starting cleanup of the ceph resources for subVolumeGroup %q in namespace %q", svg.Name, svg.Namespace)
+	svgName := svg.Spec.Name
+	// use resource name if `spec.Name` is empty in the subvolumeGroup CR.
+	if svgName == "" {
+		svgName = svg.Name
+	}
+	cleanupConfig := map[string]string{
+		opcontroller.CephFSSubVolumeGroupNameEnv: svgName,
+		opcontroller.CephFSNameEnv:               svg.Spec.FilesystemName,
+		opcontroller.CSICephFSRadosNamesaceEnv:   "csi",
+		opcontroller.CephFSMetaDataPoolNameEnv:   file.GenerateMetaDataPoolName(svg.Spec.FilesystemName),
+	}
+	cleanup := opcontroller.NewResourceCleanup(svg, cephCluster, r.opConfig.Image, cleanupConfig)
+	jobName := k8sutil.TruncateNodeNameForJob("cleanup-svg-%s", fmt.Sprintf("%s-%s", svg.Spec.FilesystemName, svg.Name))
+	err := cleanup.StartJob(r.clusterInfo.Context, r.context.Clientset, jobName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to run clean up job to clean the ceph resources in cephFS subVolumeGroup %q", svg.Name)
+	}
+	return nil
+}
+
+func formatPinning(pinning cephv1.CephFilesystemSubVolumeGroupSpecPinning) string {
+	var formatted string
+
+	if pinning.Export != nil {
+		formatted = fmt.Sprintf("export=%d", *pinning.Export)
+	} else if pinning.Distributed != nil {
+		formatted = fmt.Sprintf("distributed=%d", *pinning.Distributed)
+	} else if pinning.Random != nil {
+		formatted = fmt.Sprintf("random=%.2f", *pinning.Random)
+	} else {
+		formatted = fmt.Sprintf("distributed=%d", 1)
+	}
+
+	return formatted
 }
