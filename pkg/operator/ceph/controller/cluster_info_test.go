@@ -29,6 +29,7 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -74,11 +75,41 @@ func TestCreateClusterSecrets(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, adminSecret, string(secret.Data["ceph-secret"]))
 
+	// ensure secret owner info can be loaded and is useful
+	// this is what the owner info looks like in a live cluster
+	ownerController := true
+	blockOwnerDel := true
+	secret.OwnerReferences[0] = metav1.OwnerReference{
+		APIVersion:         "ceph.rook.io/v1",
+		Kind:               "CephCluster",
+		Name:               "my-cluster",
+		UID:                "e55604f2-710c-4353-9a3e-9d23ea2d6eb9", // random uuid
+		Controller:         &ownerController,
+		BlockOwnerDeletion: &blockOwnerDel,
+	}
+	_, err = clientset.CoreV1().Secrets(namespace).Update(ctx, secret, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+	info, _, _, err = CreateOrLoadClusterInfo(context, ctx, namespace, ownerInfo, cephClusterSpec)
+	assert.NoError(t, err)
+	// use the SetOwnerReference() method to ensure that the loaded OwnerInfo is usable and correct
+	cm := corev1.ConfigMap{}
+	cm.Name = "bob"
+	cm.Namespace = namespace
+	err = info.OwnerInfo.SetOwnerReference(&cm)
+	assert.NoError(t, err)
+	cmOwner := cm.OwnerReferences[0]
+	assert.Equal(t, "ceph.rook.io/v1", cmOwner.APIVersion)
+	assert.Equal(t, "CephCluster", cmOwner.Kind)
+	assert.Equal(t, "my-cluster", cmOwner.Name)
+	assert.Equal(t, "e55604f2-710c-4353-9a3e-9d23ea2d6eb9", string(cmOwner.UID))
+	assert.True(t, *cmOwner.Controller)
+	assert.True(t, *cmOwner.BlockOwnerDeletion)
+
 	// For backward compatibility check that the admin secret can be loaded as previously specified
 	// Update the secret as if created in an old cluster
 	delete(secret.Data, CephUserSecretKey)
 	delete(secret.Data, CephUsernameKey)
-	secret.Data[adminSecretNameKey] = []byte(adminSecret)
+	secret.Data[AdminSecretNameKey] = []byte(adminSecret)
 	_, err = clientset.CoreV1().Secrets(namespace).Update(ctx, secret, metav1.UpdateOptions{})
 	assert.NoError(t, err)
 
@@ -89,7 +120,7 @@ func TestCreateClusterSecrets(t *testing.T) {
 	assert.Equal(t, adminSecret, info.CephCred.Secret)
 
 	// Fail to load the external cluster if the admin placeholder is specified
-	secret.Data[adminSecretNameKey] = []byte(adminSecretNameKey)
+	secret.Data[AdminSecretNameKey] = []byte(AdminSecretNameKey)
 	_, err = clientset.CoreV1().Secrets(namespace).Update(ctx, secret, metav1.UpdateOptions{})
 	assert.NoError(t, err)
 	_, _, _, err = CreateOrLoadClusterInfo(context, ctx, namespace, ownerInfo, cephClusterSpec)

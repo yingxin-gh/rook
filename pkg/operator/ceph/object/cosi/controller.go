@@ -51,6 +51,7 @@ const (
 	cosiSocketMountPath       = "/var/lib/cosi"
 	DefaultServiceAccountName = "objectstorage-provisioner"
 	cosiSocketVolumeName      = "socket"
+	CephCOSIDriverPrefix      = "rook-ceph"
 )
 
 var (
@@ -93,13 +94,13 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 
 	logger.Info("successfully started")
 	// Watch for changes to CephCOSIDriver
-	err = controller.Watch(source.Kind(mgr.GetCache(), &cephv1.CephCOSIDriver{}), &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = controller.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephCOSIDriver{}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate()))
 	if err != nil {
 		return errors.Wrap(err, "failed to watch for CephCOSIDriver object changes")
 	}
 
 	// Watch for changes to CephObjectStore as arbitrary resource and predicate functions
-	err = controller.Watch(source.Kind(mgr.GetCache(), &cephv1.CephObjectStore{}), &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = controller.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephObjectStore{}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate()))
 	if err != nil {
 		return errors.Wrap(err, "failed to watch for CephObjectStore object changes")
 	}
@@ -118,11 +119,17 @@ func (r *ReconcileCephCOSIDriver) Reconcile(context context.Context, request rec
 func (r *ReconcileCephCOSIDriver) reconcile(request reconcile.Request) (reconcile.Result, cephv1.CephCOSIDriver, error) {
 	cephCOSIDriver := &cephv1.CephCOSIDriver{}
 
-	// Fetch the CephCOSIDriver instance
-	err := r.client.Get(r.opManagerContext, request.NamespacedName, cephCOSIDriver)
-	logger.Debugf("CephCOSIDriver: %+v", cephCOSIDriver)
+	// Check No of instances of CephCOSIDriver
+	cephCOSIDriverList := &cephv1.CephCOSIDriverList{}
+	err := r.client.List(r.opManagerContext, cephCOSIDriverList)
 	if err != nil && client.IgnoreNotFound(err) != nil {
-		return reconcile.Result{}, *cephCOSIDriver, errors.Wrapf(err, "failed to get Ceph COSI Driver %s", request.NamespacedName)
+		return reconcile.Result{}, *cephCOSIDriver, errors.Wrap(err, "failed to list CephCOSIDriver")
+	}
+	if len(cephCOSIDriverList.Items) > 1 {
+		return reconcile.Result{}, *cephCOSIDriver, errors.New("more than one instance of CephCOSIDriver found")
+	} else if len(cephCOSIDriverList.Items) == 1 {
+		cephCOSIDriver = &cephCOSIDriverList.Items[0]
+		logger.Debugf("CephCOSIDriver: %+v", cephCOSIDriver)
 	}
 
 	// While in experimental mode, the COSI driver is not enabled by default
@@ -157,9 +164,9 @@ func (r *ReconcileCephCOSIDriver) reconcile(request reconcile.Request) (reconcil
 		cephCOSIDriver.Name = CephCOSIDriverName
 	}
 
-	// Set the default CephCOSIDriver namespace if not already set
-	if cephCOSIDriver.Namespace == "" {
-		cephCOSIDriver.Namespace = os.Getenv(k8sutil.PodNamespaceEnvVar)
+	// The ceph-cosi-driver CRD should be same namespace as the operator
+	if cephCOSIDriver.Namespace != os.Getenv(k8sutil.PodNamespaceEnvVar) {
+		return reconcile.Result{}, *cephCOSIDriver, errors.New("Ceph COSI Driver namespace must be same as operator")
 	}
 
 	// Check whether object store is running

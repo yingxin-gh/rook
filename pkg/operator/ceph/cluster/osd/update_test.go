@@ -75,6 +75,8 @@ func Test_updateExistingOSDs(t *testing.T) {
 		updateInjectFailures    k8sutil.Failures // return failures from mocked updateDeploymentAndWaitFunc
 		returnOkToStopIDs       []int            // return these IDs are ok-to-stop (or not ok to stop if empty)
 		forceUpgradeIfUnhealthy bool
+		requiresHealthyPGs      bool
+		cephStatus              string
 	)
 
 	// intermediates (created from inputs)
@@ -108,6 +110,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 		clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 		spec := cephv1.ClusterSpec{
 			ContinueUpgradeAfterChecksEvenIfNotHealthy: forceUpgradeIfUnhealthy,
+			UpgradeOSDRequiresHealthyPGs:               requiresHealthyPGs,
 		}
 		c = New(ctx, clusterInfo, spec, "rook/rook:master")
 		config := c.newProvisionConfig()
@@ -164,16 +167,19 @@ func Test_updateExistingOSDs(t *testing.T) {
 					return cephclientfake.OSDDeviceClassOutput(args[3]), nil
 				}
 			}
+			if args[0] == "status" {
+				return cephStatus, nil
+			}
 			panic(fmt.Sprintf("unexpected command %q with args %v", command, args))
 		},
 	}
 
 	// simple wrappers to allow us to count how many OSDs on nodes/PVCs are identified
-	deploymentOnNodeFunc = func(c *Cluster, osd OSDInfo, nodeName string, config *provisionConfig) (*appsv1.Deployment, error) {
+	deploymentOnNodeFunc = func(c *Cluster, osd *OSDInfo, nodeName string, config *provisionConfig) (*appsv1.Deployment, error) {
 		osdsOnNodes = append(osdsOnNodes, osd.ID)
 		return deploymentOnNode(c, osd, nodeName, config)
 	}
-	deploymentOnPVCFunc = func(c *Cluster, osd OSDInfo, pvcName string, config *provisionConfig) (*appsv1.Deployment, error) {
+	deploymentOnPVCFunc = func(c *Cluster, osd *OSDInfo, pvcName string, config *provisionConfig) (*appsv1.Deployment, error) {
 		osdsOnPVCs = append(osdsOnPVCs, osd.ID)
 		return deploymentOnPVC(c, osd, pvcName, config)
 	}
@@ -361,6 +367,43 @@ func Test_updateExistingOSDs(t *testing.T) {
 		assert.Equal(t, 0, updateQueue.Len()) // the OSD should now have been removed from the queue
 	})
 
+	t.Run("PGs not clean to upgrade OSD", func(t *testing.T) {
+		clientset = fake.NewSimpleClientset()
+		updateQueue = newUpdateQueueWithIDs(2)
+		existingDeployments = newExistenceListWithIDs(2)
+		requiresHealthyPGs = true
+		cephStatus = unHealthyCephStatus
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+
+		osdToBeQueried = 2
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{})
+		assert.Equal(t, 1, updateQueue.Len()) // the OSD should remain
+
+	})
+
+	t.Run("PGs clean to upgrade OSD", func(t *testing.T) {
+		clientset = fake.NewSimpleClientset()
+		updateQueue = newUpdateQueueWithIDs(0)
+		existingDeployments = newExistenceListWithIDs(0)
+		requiresHealthyPGs = true
+		cephStatus = healthyCephStatus
+		forceUpgradeIfUnhealthy = true // FORCE UPDATES
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+		addDeploymentOnNode("node0", 0)
+
+		osdToBeQueried = 0
+		returnOkToStopIDs = []int{0}
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(0)})
+		assert.Equal(t, 0, updateQueue.Len()) // should be done with updates
+
+	})
+
 	t.Run("continueUpgradesAfterChecksEvenIfUnhealthy = true", func(t *testing.T) {
 		clientset = fake.NewSimpleClientset()
 		updateQueue = newUpdateQueueWithIDs(2)
@@ -514,7 +557,7 @@ func Test_getOSDUpdateInfo(t *testing.T) {
 	}
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   namespace,
-		CephVersion: cephver.Quincy,
+		CephVersion: cephver.Squid,
 	}
 	clusterInfo.SetName("mycluster")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
@@ -546,7 +589,7 @@ func Test_getOSDUpdateInfo(t *testing.T) {
 		// osd.1 and 3 in another namespace (another Rook cluster)
 		clusterInfo2 := &cephclient.ClusterInfo{
 			Namespace:   "other-namespace",
-			CephVersion: cephver.Quincy,
+			CephVersion: cephver.Squid,
 		}
 		clusterInfo2.SetName("other-cluster")
 		clusterInfo2.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)

@@ -29,6 +29,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rook/rook/cmd/rook/rook"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/daemon/ceph/client"
 	osddaemon "github.com/rook/rook/pkg/daemon/ceph/osd"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	oposd "github.com/rook/rook/pkg/operator/ceph/cluster/osd"
@@ -255,11 +256,15 @@ func prepareOSD(cmd *cobra.Command, args []string) error {
 	clusterInfo.Context = cmd.Context()
 	kv := k8sutil.NewConfigMapKVStore(clusterInfo.Namespace, context.Clientset, ownerInfo)
 
+	if err := client.WriteCephConfig(context, &clusterInfo); err != nil {
+		return errors.Wrap(err, "failed to generate ceph config")
+	}
+
 	// destroy the OSD using the OSD ID
-	var replaceOSD *oposd.OSDReplaceInfo
+	var replaceOSD *oposd.OSDInfo
 	if replaceOSDID != -1 {
 		logger.Infof("destroying osd.%d and cleaning its backing device", replaceOSDID)
-		replaceOSD, err = osddaemon.DestroyOSD(context, &clusterInfo, replaceOSDID, cfg.pvcBacked, cfg.storeConfig.EncryptedDevice)
+		replaceOSD, err = osddaemon.DestroyOSD(context, &clusterInfo, replaceOSDID, cfg.pvcBacked)
 		if err != nil {
 			rook.TerminateFatal(errors.Wrapf(err, "failed to destroy OSD %d.", replaceOSDID))
 		}
@@ -326,12 +331,8 @@ func removeOSDs(cmd *cobra.Command, args []string) error {
 		return errors.Wrapf(err, "failed to parse --preserve-pvc flag")
 	}
 
-	exitIfNotSafe := false
-	forceRemovalCallback := func(x int) (bool, bool) {
-		return forceOSDRemovalBool, exitIfNotSafe
-	}
 	// Run OSD remove sequence
-	err = osddaemon.RemoveOSDs(context, &clusterInfo, strings.Split(osdIDsToRemove, ","), preservePVCBool, forceRemovalCallback)
+	err = osddaemon.RemoveOSDs(context, &clusterInfo, strings.Split(osdIDsToRemove, ","), preservePVCBool, forceOSDRemovalBool)
 	if err != nil {
 		rook.TerminateFatal(err)
 	}

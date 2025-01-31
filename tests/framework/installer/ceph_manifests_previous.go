@@ -24,7 +24,7 @@ import (
 
 const (
 	// The version from which the upgrade test will start
-	Version1_12 = "v1.12.7"
+	Version1_15 = "v1.15.6"
 )
 
 // CephManifestsPreviousVersion wraps rook yaml definitions
@@ -131,8 +131,11 @@ func (m *CephManifestsPreviousVersion) GetNFSPool() string {
 	return m.latest.GetNFSPool()
 }
 
-func (m *CephManifestsPreviousVersion) GetObjectStore(name string, replicaCount, port int, tlsEnable bool) string {
-	return m.latest.GetObjectStore(name, replicaCount, port, tlsEnable)
+func (m *CephManifestsPreviousVersion) GetObjectStore(name string, replicaCount, port int, tlsEnable bool, swiftAndKeystone bool) string {
+	if swiftAndKeystone {
+		panic("Previous version does not support swift or keystone")
+	}
+	return m.latest.GetObjectStore(name, replicaCount, port, tlsEnable, false)
 }
 
 func (m *CephManifestsPreviousVersion) GetObjectStoreUser(name, displayName, store, usercaps, maxsize string, maxbuckets, maxobjects int) string {

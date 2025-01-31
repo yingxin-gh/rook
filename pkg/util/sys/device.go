@@ -19,6 +19,7 @@ package sys
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	osexec "os/exec"
 	"strconv"
 	"strings"
@@ -93,7 +94,7 @@ type LocalDisk struct {
 	Type string `json:"type"`
 	// Rotational is the boolean whether the device is rotational: true for hdd, false for ssd and nvme
 	Rotational bool `json:"rotational"`
-	// ReadOnly is the boolean whether the device is readonly
+	// Readonly is the boolean whether the device is readonly
 	Readonly bool `json:"readOnly"`
 	// Partitions is a partition slice
 	Partitions []Partition
@@ -279,7 +280,7 @@ func GetDiskUUID(device string, executor exec.Executor) (string, error) {
 	return parseUUID(device, output)
 }
 
-func GetDiskDeviceClass(disk *LocalDisk) string {
+func GetDiskDeviceType(disk *LocalDisk) string {
 	if disk.Rotational {
 		return "hdd"
 	}
@@ -287,6 +288,15 @@ func GetDiskDeviceClass(disk *LocalDisk) string {
 		return "nvme"
 	}
 	return "ssd"
+}
+
+func GetDiskDeviceClass(crushDeviceClassVarName, deviceType string) string {
+	crushDeviceClass := os.Getenv(crushDeviceClassVarName)
+	if crushDeviceClass != "" {
+		return crushDeviceClass
+	} else {
+		return deviceType
+	}
 }
 
 // CheckIfDeviceAvailable checks if a device is available for consumption. The caller

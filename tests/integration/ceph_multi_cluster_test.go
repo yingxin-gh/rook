@@ -73,17 +73,16 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 	s.poolName = "multi-cluster-pool1"
 	coreNamespace := "multi-core"
 	s.settings = &installer.TestCephSettings{
-		ClusterName:               "multi-cluster",
-		Namespace:                 coreNamespace,
-		OperatorNamespace:         installer.SystemNamespace(coreNamespace),
-		StorageClassName:          "manual",
-		UsePVC:                    installer.UsePVC(),
-		Mons:                      1,
-		MultipleMgrs:              true,
-		EnableAdmissionController: true,
-		RookVersion:               installer.LocalBuildTag,
-		CephVersion:               installer.QuincyVersion,
-		RequireMsgr2:              true,
+		ClusterName:       "multi-cluster",
+		Namespace:         coreNamespace,
+		OperatorNamespace: installer.SystemNamespace(coreNamespace),
+		StorageClassName:  "manual",
+		UsePVC:            installer.UsePVC(),
+		Mons:              1,
+		MultipleMgrs:      true,
+		RookVersion:       installer.LocalBuildTag,
+		CephVersion:       installer.SquidVersion,
+		RequireMsgr2:      true,
 	}
 	s.settings.ApplyEnvVars()
 	externalSettings := &installer.TestCephSettings{
@@ -92,7 +91,7 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 		Namespace:         "multi-external",
 		OperatorNamespace: s.settings.OperatorNamespace,
 		RookVersion:       s.settings.RookVersion,
-		CephVersion:       installer.QuincyVersion,
+		CephVersion:       installer.SquidVersion,
 	}
 	externalSettings.ApplyEnvVars()
 	s.externalManifests = installer.NewCephManifests(externalSettings)

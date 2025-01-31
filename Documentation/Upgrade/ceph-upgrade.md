@@ -18,44 +18,20 @@ until all the daemons have been updated.
 ## Considerations
 
 * **WARNING**: Upgrading a Rook cluster is not without risk. There may be unexpected issues or
-  obstacles that damage the integrity and health of the storage cluster, including data loss.
+    obstacles that damage the integrity and health of the storage cluster, including data loss.
 * The Rook cluster's storage may be unavailable for short periods during the upgrade process.
 * Read this document in full before undertaking a Rook cluster upgrade.
 
 ## Supported Versions
 
-Rook v1.13 supports the following Ceph versions:
+Rook v1.16 supports the following Ceph versions:
 
+* Ceph Squid v19.2.0 or newer
 * Ceph Reef v18.2.0 or newer
-* Ceph Quincy v17.2.0 or newer
-
-Support for Ceph Pacific (16.2.x) is removed in Rook v1.13. Upgrade to Quincy or Reef before upgrading
-to Rook v1.13.
 
 !!! important
     When an update is requested, the operator will check Ceph's status,
     **if it is in `HEALTH_ERR` the operator will refuse to proceed with the upgrade.**
-
-!!! warning
-    Ceph v17.2.2 has a blocking issue when running with Rook. Use v17.2.3 or newer when possible.
-
-### Quincy Consideration
-
-In Ceph Quincy (v17), the `device_health_metrics` pool was renamed to `.mgr`. Ceph will perform this
-migration automatically. The pool rename will be automatically handled by Rook if the configuration
-of the `device_health_metrics` pool is not customized via CephBlockPool.
-
-If the configuration of the `device_health_metrics` pool is customized via CephBlockPool, two extra
-steps are required after the Ceph upgrade is complete. Once upgrade is complete:
-
-1. Create a new CephBlockPool to configure the `.mgr` built-in pool. For an example, see
-   [builtin mgr pool](https://github.com/rook/rook/blob/master/deploy/examples/pool-builtin-mgr.yaml).
-2. Delete the old CephBlockPool that represents the `device_health_metrics` pool.
-
-### CephNFS User Consideration
-
-Ceph Quincy v17.2.1 has a potentially breaking regression with CephNFS. See the NFS documentation's
-[known issue](../CRDs/ceph-nfs-crd.md#ceph-v1721) for more detail.
 
 ### Ceph Images
 
@@ -63,15 +39,15 @@ Official Ceph container images can be found on [Quay](https://quay.io/repository
 
 These images are tagged in a few ways:
 
-* The most explicit form of tags are full-ceph-version-and-build tags (e.g., `v17.2.6-20230410`).
-  These tags are recommended for production clusters, as there is no possibility for the cluster to
-  be heterogeneous with respect to the version of Ceph running in containers.
-* Ceph major version tags (e.g., `v17`) are useful for development and test clusters so that the
-  latest version of Ceph is always available.
+* The most explicit form of tags are full-ceph-version-and-build tags (e.g., `v19.2.0-20240927`).
+    These tags are recommended for production clusters, as there is no possibility for the cluster to
+    be heterogeneous with respect to the version of Ceph running in containers.
+* Ceph major version tags (e.g., `v19`) are useful for development and test clusters so that the
+    latest version of Ceph is always available.
 
 **Ceph containers other than the official images from the registry above will not be supported.**
 
-### Example Upgrade to Ceph Quincy
+### Example Upgrade to Ceph Reef
 
 #### **1. Update the Ceph daemons**
 
@@ -80,7 +56,7 @@ CephCluster CRD (`spec.cephVersion.image`).
 
 ```console
 ROOK_CLUSTER_NAMESPACE=rook-ceph
-NEW_CEPH_IMAGE='quay.io/ceph/ceph:v17.2.6-20230410'
+NEW_CEPH_IMAGE='quay.io/ceph/ceph:v19.2.0-20240927'
 kubectl -n $ROOK_CLUSTER_NAMESPACE patch CephCluster $ROOK_CLUSTER_NAMESPACE --type=merge -p "{\"spec\": {\"cephVersion\": {\"image\": \"$NEW_CEPH_IMAGE\"}}}"
 ```
 
@@ -92,7 +68,7 @@ employed by the new Rook operator release. Employing an outdated Ceph version wi
 in unexpected behaviour.
 
 ```console
-kubectl -n rook-ceph set image deploy/rook-ceph-tools rook-ceph-tools=quay.io/ceph/ceph:v17.2.6-20230410
+kubectl -n rook-ceph set image deploy/rook-ceph-tools rook-ceph-tools=quay.io/ceph/ceph:v19.2.0-20240927
 ```
 
 #### **3. Wait for the pod updates**
@@ -109,10 +85,10 @@ Confirm the upgrade is completed when the versions are all on the desired Ceph v
 ```console
 kubectl -n $ROOK_CLUSTER_NAMESPACE get deployment -l rook_cluster=$ROOK_CLUSTER_NAMESPACE -o jsonpath='{range .items[*]}{"ceph-version="}{.metadata.labels.ceph-version}{"\n"}{end}' | sort | uniq
 This cluster is not yet finished:
-    ceph-version=15.2.13-0
-    ceph-version=v17.2.6-0
+    ceph-version=v18.2.4-0
+    ceph-version=v19.2.0-0
 This cluster is finished:
-    ceph-version=v17.2.6-0
+    ceph-version=v19.2.0-0
 ```
 
 #### **4. Verify cluster health**

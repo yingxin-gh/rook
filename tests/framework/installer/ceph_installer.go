@@ -43,13 +43,13 @@ import (
 
 const (
 	// test with the latest releases
-	quincyTestImage = "quay.io/ceph/ceph:v17"
-	reefTestImage   = "quay.io/ceph/ceph:v18"
+	reefTestImage  = "quay.io/ceph/ceph:v18"
+	squidTestImage = "quay.io/ceph/ceph:v19"
 	// test with the current development versions
-	quincyDevelTestImage = "quay.io/ceph/daemon-base:latest-quincy-devel"
-	reefDevelTestImage   = "quay.io/ceph/daemon-base:latest-reef-devel"
+	reefDevelTestImage  = "quay.ceph.io/ceph-ci/ceph:reef"
+	squidDevelTestImage = "quay.ceph.io/ceph-ci/ceph:squid"
 	// test with the latest Ceph main image
-	mainTestImage      = "quay.io/ceph/daemon-base:latest-main-devel"
+	mainTestImage      = "quay.ceph.io/ceph-ci/ceph:main"
 	cephOperatorLabel  = "app=rook-ceph-operator"
 	defaultclusterName = "test-cluster"
 
@@ -67,10 +67,10 @@ mon compact on start = true
 )
 
 var (
-	QuincyVersion                = cephv1.CephVersionSpec{Image: quincyTestImage}
-	QuincyDevelVersion           = cephv1.CephVersionSpec{Image: quincyDevelTestImage}
 	ReefVersion                  = cephv1.CephVersionSpec{Image: reefTestImage}
 	ReefDevelVersion             = cephv1.CephVersionSpec{Image: reefDevelTestImage}
+	SquidVersion                 = cephv1.CephVersionSpec{Image: squidTestImage}
+	SquidDevelVersion            = cephv1.CephVersionSpec{Image: squidDevelTestImage}
 	MainVersion                  = cephv1.CephVersionSpec{Image: mainTestImage, AllowUnsupported: true}
 	volumeReplicationBaseURL     = fmt.Sprintf("https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/%s/config/crd/bases/", volumeReplicationVersion)
 	volumeReplicationCRDURL      = volumeReplicationBaseURL + "replication.storage.openshift.io_volumereplications.yaml"
@@ -93,12 +93,13 @@ func ReturnCephVersion() cephv1.CephVersionSpec {
 	switch os.Getenv("CEPH_SUITE_VERSION") {
 	case "main":
 		return MainVersion
-	case "quincy-devel":
-		return QuincyDevelVersion
 	case "reef-devel":
 		return ReefDevelVersion
+	case "squid-devel":
+		return SquidDevelVersion
 	default:
-		return ReefDevelVersion
+		// Default to the latest stable version
+		return SquidVersion
 	}
 }
 
@@ -135,11 +136,6 @@ func (h *CephInstaller) CreateCephOperator() (err error) {
 		}
 	}
 
-	err = h.startAdmissionController()
-	if err != nil {
-		return errors.Errorf("Failed to start admission controllers: %v", err)
-	}
-
 	if err := h.CreateVolumeReplicationCRDs(); err != nil {
 		return errors.Wrap(err, "failed to create volume replication CRDs")
 	}
@@ -167,37 +163,6 @@ func (h *CephInstaller) CreateVolumeReplicationCRDs() (err error) {
 	if _, err := h.k8shelper.KubectlWithStdin(readManifestFromURL(volumeReplicationClassCRDURL), createFromStdinArgs...); err != nil {
 		return errors.Wrap(err, "failed to create volumereplicationclass CRD")
 	}
-	return nil
-}
-
-func (h *CephInstaller) startAdmissionController() error {
-	if !h.k8shelper.VersionAtLeast("v1.16.0") {
-		logger.Info("skipping the admission controller on K8s version older than v1.16")
-		return nil
-	}
-	if !h.settings.EnableAdmissionController {
-		logger.Info("skipping admission controller for this test suite")
-		return nil
-	}
-	if utils.IsPlatformOpenShift() {
-		logger.Info("skipping the admission controller on OpenShift")
-		return nil
-	}
-
-	rootPath, err := utils.FindRookRoot()
-	if err != nil {
-		return errors.Errorf("failed to find rook root. %v", err)
-	}
-	userHome, err := os.UserHomeDir()
-	if err != nil {
-		return errors.Errorf("failed to find user home directory. %v", err)
-	}
-	scriptPath := path.Join(rootPath, "tests/scripts/deploy_cert_manager.sh")
-	err = h.k8shelper.MakeContext().Executor.ExecuteCommandWithEnv([]string{fmt.Sprintf("NAMESPACE=%s", h.settings.OperatorNamespace), fmt.Sprintf("HOME=%s", userHome)}, "bash", scriptPath)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -301,7 +266,12 @@ func (h *CephInstaller) CreateCephCluster() error {
 }
 
 func (h *CephInstaller) waitForCluster() error {
-	if err := h.k8shelper.WaitForPodCount("app=rook-ceph-mon", h.settings.Namespace, h.settings.Mons); err != nil {
+	monWaitLabel := "app=rook-ceph-mon,mon_daemon=true"
+	if h.Manifests.Settings().RookVersion == Version1_15 {
+		// TODO: Remove this when upgrade test is from v1.15.7 since prior releases do not have the mon_daemon label
+		monWaitLabel = "app=rook-ceph-mon"
+	}
+	if err := h.k8shelper.WaitForPodCount(monWaitLabel, h.settings.Namespace, h.settings.Mons); err != nil {
 		return err
 	}
 
@@ -556,7 +526,7 @@ func (h *CephInstaller) InstallRook() (bool, error) {
 
 	if h.settings.UseHelm {
 		// Install Prometheus so we can create the prometheus rules
-		args := []string{"apply", "-f", "https://raw.githubusercontent.com/coreos/prometheus-operator/v0.40.0/bundle.yaml"}
+		args := []string{"create", "-f", "https://raw.githubusercontent.com/coreos/prometheus-operator/v0.71.1/bundle.yaml"}
 		_, err = h.k8shelper.MakeContext().Executor.ExecuteCommandWithOutput("kubectl", args...)
 		if err != nil {
 			return false, errors.Wrap(err, "failed to install prometheus")
@@ -794,9 +764,6 @@ func (h *CephInstaller) UninstallRookFromMultipleNS(manifests ...CephManifests) 
 
 	err = h.k8shelper.DeleteResourceAndWait(false, "namespace", h.settings.OperatorNamespace)
 	checkError(h.T(), err, fmt.Sprintf("cannot delete operator namespace %s", h.settings.OperatorNamespace))
-
-	err = h.k8shelper.Clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Delete(ctx, "rook-ceph-webhook", metav1.DeleteOptions{})
-	checkError(h.T(), err, "failed to delete webhook configuration")
 
 	logger.Infof("done removing the operator from namespace %s", h.settings.OperatorNamespace)
 	logger.Infof("removing host data dir %s", h.hostPathToDelete)

@@ -74,29 +74,16 @@ func add(ctx context.Context, context *clusterd.Context, mgr manager.Manager, r 
 	logger.Infof("%s successfully started", controllerName)
 
 	// Watch for ConfigMap (operator config)
-	s := source.Kind(
+	s := source.Kind[client.Object](
 		mgr.GetCache(),
-		&v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}})
-	err = c.Watch(s, &handler.EnqueueRequestForObject{}, predicateController(ctx, mgr.GetClient()))
+		&v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}},
+		&handler.EnqueueRequestForObject{}, predicateController(ctx, mgr.GetClient()),
+	)
+	err = c.Watch(s)
 	if err != nil {
 		return err
 	}
 
-	value, err := k8sutil.GetOperatorSetting(ctx, context.Clientset, opcontroller.OperatorSettingConfigMapName, "ROOK_DISABLE_ADMISSION_CONTROLLER", "true")
-	if err != nil {
-		return err
-	}
-
-	if value == "false" {
-		// Watch for Secret (admission controller secret)
-		s := source.Kind(
-			mgr.GetCache(),
-			&v1.Secret{TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: v1.SchemeGroupVersion.String()}})
-		err = c.Watch(s, &handler.EnqueueRequestForObject{}, predicateController(ctx, mgr.GetClient()))
-		if err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -145,9 +132,8 @@ func (r *ReconcileConfig) reconcile(request reconcile.Request) (reconcile.Result
 	}
 
 	opcontroller.SetAllowLoopDevices(r.config.Parameters)
-
-	// Reconcile webhook secret
-	// This is done in the predicate function
+	opcontroller.SetEnforceHostNetwork(r.config.Parameters)
+	opcontroller.SetRevisionHistoryLimit(r.config.Parameters)
 
 	logger.Infof("%s done reconciling", controllerName)
 	return reconcile.Result{}, nil

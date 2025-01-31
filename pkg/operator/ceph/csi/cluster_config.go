@@ -33,6 +33,8 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	cephcsi "github.com/ceph/ceph-csi/api/deploy/kubernetes"
 )
 
 var (
@@ -40,40 +42,18 @@ var (
 	configMutex sync.Mutex
 )
 
-type CsiClusterConfigEntry struct {
-	ClusterID      string                   `json:"clusterID"`
-	Monitors       []string                 `json:"monitors"`
-	Namespace      string                   `json:"namespace"`
-	CephFS         *CsiCephFSSpec           `json:"cephFS,omitempty"`
-	NFS            *CsiNFSSpec              `json:"nfs,omitempty"`
-	RBD            *CsiRBDSpec              `json:"rbd,omitempty"`
-	RadosNamespace string                   `json:"radosNamespace,omitempty"`
-	ReadAffinity   *cephv1.ReadAffinitySpec `json:"readAffinity,omitempty"`
+type CSIClusterConfigEntry struct {
+	cephcsi.ClusterInfo
+	Namespace string `json:"namespace"`
 }
 
-type CsiCephFSSpec struct {
-	NetNamespaceFilePath string `json:"netNamespaceFilePath,omitempty"`
-	SubvolumeGroup       string `json:"subvolumeGroup,omitempty"`
-	KernelMountOptions   string `json:"kernelMountOptions,omitempty"`
-	FuseMountOptions     string `json:"fuseMountOptions,omitempty"`
-}
-
-type CsiNFSSpec struct {
-	NetNamespaceFilePath string `json:"netNamespaceFilePath,omitempty"`
-}
-
-type CsiRBDSpec struct {
-	NetNamespaceFilePath string `json:"netNamespaceFilePath,omitempty"`
-	RadosNamespace       string `json:"radosNamespace,omitempty"`
-}
-
-type csiClusterConfig []CsiClusterConfigEntry
+type csiClusterConfig []CSIClusterConfigEntry
 
 // FormatCsiClusterConfig returns a json-formatted string containing
 // the cluster-to-mon mapping required to configure ceph csi.
 func FormatCsiClusterConfig(
-	clusterKey string, mons map[string]*cephclient.MonInfo) (string, error) {
-
+	clusterKey string, mons map[string]*cephclient.MonInfo,
+) (string, error) {
 	cc := make(csiClusterConfig, 1)
 	cc[0].ClusterID = clusterKey
 	cc[0].Monitors = []string{}
@@ -123,12 +103,55 @@ func MonEndpoints(mons map[string]*cephclient.MonInfo, requireMsgr2 bool) []stri
 	return endpoints
 }
 
+// updateNetNamespaceFilePath modify the netNamespaceFilePath for all cluster IDs.
+// If holderEnabled is set to true. Otherwise, removes the netNamespaceFilePath value
+// for all the clusterIDs.
+func updateNetNamespaceFilePath(clusterNamespace string, cc csiClusterConfig) {
+	var (
+		cephFSNetNamespaceFilePath string
+		rbdNetNamespaceFilePath    string
+		nfsNetNamespaceFilePath    string
+	)
+
+	if IsHolderEnabled() {
+		for _, centry := range cc {
+			if centry.Namespace == clusterNamespace && centry.ClusterID == clusterNamespace {
+				if centry.CephFS.NetNamespaceFilePath != "" {
+					cephFSNetNamespaceFilePath = centry.CephFS.NetNamespaceFilePath
+				}
+				if centry.RBD.NetNamespaceFilePath != "" {
+					rbdNetNamespaceFilePath = centry.RBD.NetNamespaceFilePath
+				}
+				if centry.NFS.NetNamespaceFilePath != "" {
+					nfsNetNamespaceFilePath = centry.NFS.NetNamespaceFilePath
+				}
+			}
+		}
+
+		for i, centry := range cc {
+			if centry.Namespace == clusterNamespace {
+				cc[i].CephFS.NetNamespaceFilePath = cephFSNetNamespaceFilePath
+				cc[i].RBD.NetNamespaceFilePath = rbdNetNamespaceFilePath
+				cc[i].NFS.NetNamespaceFilePath = nfsNetNamespaceFilePath
+			}
+		}
+	} else {
+		for i := range cc {
+			if cc[i].Namespace == clusterNamespace {
+				cc[i].CephFS.NetNamespaceFilePath = ""
+				cc[i].RBD.NetNamespaceFilePath = ""
+				cc[i].NFS.NetNamespaceFilePath = ""
+			}
+		}
+	}
+}
+
 // updateCsiClusterConfig returns a json-formatted string containing
 // the cluster-to-mon mapping required to configure ceph csi.
-func updateCsiClusterConfig(curr, clusterKey string, newCsiClusterConfigEntry *CsiClusterConfigEntry) (string, error) {
+func updateCsiClusterConfig(curr, clusterID, clusterNamespace string, newCsiClusterConfigEntry *CSIClusterConfigEntry) (string, error) {
 	var (
 		cc     csiClusterConfig
-		centry CsiClusterConfigEntry
+		centry CSIClusterConfigEntry
 		found  bool
 	)
 
@@ -143,16 +166,27 @@ func updateCsiClusterConfig(curr, clusterKey string, newCsiClusterConfigEntry *C
 	// independently and won't collide.
 	if newCsiClusterConfigEntry != nil {
 		for i, centry := range cc {
+			// there is a bug with an unknown source where the csi config can have an empty
+			// namespace entry. detect and fix this scenario if it occurs
+			if centry.Namespace == "" && centry.ClusterID == clusterID {
+				logger.Infof("correcting CSI config map entry for cluster ID %q; empty namespace will be set to %q", clusterID, clusterNamespace)
+				centry.Namespace = clusterNamespace
+				cc[i] = centry
+			}
+
 			// If the clusterID belongs to the same cluster, update the entry.
 			// update default clusterID's entry
-			if clusterKey == centry.Namespace {
+			if clusterID == centry.Namespace {
 				centry.Monitors = newCsiClusterConfigEntry.Monitors
+				centry.ReadAffinity = newCsiClusterConfigEntry.ReadAffinity
+				centry.CephFS.KernelMountOptions = newCsiClusterConfigEntry.CephFS.KernelMountOptions
+				centry.CephFS.FuseMountOptions = newCsiClusterConfigEntry.CephFS.FuseMountOptions
 				cc[i] = centry
 			}
 		}
 	}
 	for i, centry := range cc {
-		if centry.ClusterID == clusterKey {
+		if centry.ClusterID == clusterID {
 			// If the new entry is nil, this means the entry is being deleted so remove it from the list
 			if newCsiClusterConfigEntry == nil {
 				cc = append(cc[:i], cc[i+1:]...)
@@ -160,19 +194,24 @@ func updateCsiClusterConfig(curr, clusterKey string, newCsiClusterConfigEntry *C
 				break
 			}
 			centry.Monitors = newCsiClusterConfigEntry.Monitors
-			if newCsiClusterConfigEntry.CephFS != nil && (newCsiClusterConfigEntry.CephFS.SubvolumeGroup != "" || newCsiClusterConfigEntry.CephFS.NetNamespaceFilePath != "") {
+			// update subvolumegroup and cephfs netNamespaceFilePath only when either is specified
+			// while always updating kernel and fuse mount options.
+			if newCsiClusterConfigEntry.CephFS.SubvolumeGroup != "" || newCsiClusterConfigEntry.CephFS.NetNamespaceFilePath != "" {
 				centry.CephFS = newCsiClusterConfigEntry.CephFS
+			} else {
+				centry.CephFS.KernelMountOptions = newCsiClusterConfigEntry.CephFS.KernelMountOptions
+				centry.CephFS.FuseMountOptions = newCsiClusterConfigEntry.CephFS.FuseMountOptions
 			}
-			if newCsiClusterConfigEntry.NFS != nil && newCsiClusterConfigEntry.NFS.NetNamespaceFilePath != "" {
+			// update nfs netNamespaceFilePath only when specified.
+			if newCsiClusterConfigEntry.NFS.NetNamespaceFilePath != "" {
 				centry.NFS = newCsiClusterConfigEntry.NFS
 			}
-			if newCsiClusterConfigEntry.RBD != nil && (newCsiClusterConfigEntry.RBD.RadosNamespace != "" || newCsiClusterConfigEntry.RBD.NetNamespaceFilePath != "") {
+			// update radosNamespace and rbd netNamespaceFilePath only when either is specified.
+			if newCsiClusterConfigEntry.RBD.RadosNamespace != "" || newCsiClusterConfigEntry.RBD.NetNamespaceFilePath != "" {
 				centry.RBD = newCsiClusterConfigEntry.RBD
 			}
-			// This maintains backward compatibility for existing clusters, from now on the
-			// preferred way is to use RBD.RadosNamespace
-			if newCsiClusterConfigEntry.RadosNamespace != "" {
-				centry.RadosNamespace = newCsiClusterConfigEntry.RadosNamespace
+			if len(newCsiClusterConfigEntry.ReadAffinity.CrushLocationLabels) != 0 {
+				centry.ReadAffinity = newCsiClusterConfigEntry.ReadAffinity
 			}
 			found = true
 			cc[i] = centry
@@ -183,23 +222,20 @@ func updateCsiClusterConfig(curr, clusterKey string, newCsiClusterConfigEntry *C
 		// If it's the first time we create the cluster, the entry does not exist, so the removal
 		// will fail with a dangling pointer
 		if newCsiClusterConfigEntry != nil {
-			centry.ClusterID = clusterKey
-			centry.Namespace = newCsiClusterConfigEntry.Namespace
+			centry.ClusterID = clusterID
+			centry.Namespace = clusterNamespace
 			centry.Monitors = newCsiClusterConfigEntry.Monitors
-			if newCsiClusterConfigEntry.RBD != nil && (newCsiClusterConfigEntry.RBD.RadosNamespace != "" || newCsiClusterConfigEntry.CephFS.NetNamespaceFilePath != "") {
-				centry.RBD = newCsiClusterConfigEntry.RBD
-			}
-			// Add a condition not to fill with empty values
-			if newCsiClusterConfigEntry.CephFS != nil && (newCsiClusterConfigEntry.CephFS.SubvolumeGroup != "" || newCsiClusterConfigEntry.CephFS.NetNamespaceFilePath != "") {
-				centry.CephFS = newCsiClusterConfigEntry.CephFS
-			}
-			if newCsiClusterConfigEntry.NFS != nil && newCsiClusterConfigEntry.NFS.NetNamespaceFilePath != "" {
-				centry.NFS = newCsiClusterConfigEntry.NFS
+			centry.RBD = newCsiClusterConfigEntry.RBD
+			centry.CephFS = newCsiClusterConfigEntry.CephFS
+			centry.NFS = newCsiClusterConfigEntry.NFS
+			if len(newCsiClusterConfigEntry.ReadAffinity.CrushLocationLabels) != 0 {
+				centry.ReadAffinity = newCsiClusterConfigEntry.ReadAffinity
 			}
 			cc = append(cc, centry)
 		}
 	}
 
+	updateNetNamespaceFilePath(clusterID, cc)
 	return formatCsiClusterConfig(cc)
 }
 
@@ -226,20 +262,58 @@ func CreateCsiConfigMap(ctx context.Context, namespace string, clientset kuberne
 		if !k8serrors.IsAlreadyExists(err) {
 			return errors.Wrapf(err, "failed to create initial csi config map %q (in %q)", configMap.Name, namespace)
 		}
+		// CM already exists; update owner refs to it if needed
+		// this corrects issues where the csi config map was sometimes created with CephCluster
+		// owner ref, which would result in the cm being deleted if that cluster was deleted
+		if err := updateCsiConfigMapOwnerRefs(ctx, namespace, clientset, ownerInfo); err != nil {
+			return errors.Wrapf(err, "failed to ensure csi config map %q (in %q) owner references", configMap.Name, namespace)
+		}
+	} else {
+		logger.Infof("successfully created csi config map %q", configMap.Name)
 	}
 
-	logger.Infof("successfully created csi config map %q", configMap.Name)
+	return nil
+}
+
+// check the owner references on the csi config map, and fix incorrect references if needed
+func updateCsiConfigMapOwnerRefs(ctx context.Context, namespace string, clientset kubernetes.Interface, expectedOwnerInfo *k8sutil.OwnerInfo) error {
+	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(ctx, ConfigName, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrapf(err, "failed to fetch csi config map %q (in %q) which already exists", ConfigName, namespace)
+	}
+
+	existingOwners := cm.GetOwnerReferences()
+	var currentOwner *metav1.OwnerReference = nil
+	if len(existingOwners) == 1 {
+		currentOwner = &existingOwners[0] // currentOwner is nil unless there is exactly one owner on the cm
+	}
+	// if there is exactly one owner, and it is correct --> no fix needed
+	if currentOwner != nil && (currentOwner.UID == expectedOwnerInfo.GetUID()) {
+		logger.Debugf("csi config map %q (in %q) has the expected owner; owner id: %q", ConfigName, namespace, currentOwner.UID)
+		return nil
+	}
+
+	// must fix owner refs
+	logger.Infof("updating csi configmap %q (in %q) owner info", ConfigName, namespace)
+	cm.OwnerReferences = []metav1.OwnerReference{}
+	if err := expectedOwnerInfo.SetControllerReference(cm); err != nil {
+		return errors.Wrapf(err, "failed to set updated owner reference on csi config map %q (in %q)", ConfigName, namespace)
+	}
+	_, err = clientset.CoreV1().ConfigMaps(namespace).Update(ctx, cm, metav1.UpdateOptions{})
+	if err != nil {
+		return errors.Wrapf(err, "failed to update csi config map %q (in %q) to update its owner reference", ConfigName, namespace)
+	}
+
 	return nil
 }
 
 // SaveClusterConfig updates the config map used to provide ceph-csi with
-// basic cluster configuration. The clusterNamespace and clusterInfo are
-// used to determine what "cluster" in the config map will be updated and
-// the clusterNamespace value is expected to match the clusterID
-// value that is provided to ceph-csi uses in the storage class.
-// The locker l is typically a mutex and is used to prevent the config
-// map from being updated for multiple clusters simultaneously.
-func SaveClusterConfig(clientset kubernetes.Interface, clusterNamespace string, clusterInfo *cephclient.ClusterInfo, newCsiClusterConfigEntry *CsiClusterConfigEntry) error {
+// basic cluster configuration. The clusterID, clusterNamespace, and clusterInfo are
+// used to determine what "cluster" in the config map will be updated. clusterID should be the same
+// as clusterNamespace for CephClusters, but for other resources (e.g., CephBlockPoolRadosNamespace,
+// CephFilesystemSubVolumeGroup) or for other supplementary entries, the clusterID should be unique
+// and different from the namespace so as not to disrupt CephCluster configurations.
+func SaveClusterConfig(clientset kubernetes.Interface, clusterID, clusterNamespace string, clusterInfo *cephclient.ClusterInfo, newCsiClusterConfigEntry *CSIClusterConfigEntry) error {
 	// csi is deployed into the same namespace as the operator
 	csiNamespace := os.Getenv(k8sutil.PodNamespaceEnvVar)
 	if csiNamespace == "" {
@@ -248,6 +322,15 @@ func SaveClusterConfig(clientset kubernetes.Interface, clusterNamespace string, 
 	}
 	logger.Debugf("using %q for csi configmap namespace", csiNamespace)
 
+	if newCsiClusterConfigEntry != nil {
+		// set CSIDriverOptions
+		newCsiClusterConfigEntry.ReadAffinity.Enabled = clusterInfo.CSIDriverSpec.ReadAffinity.Enabled
+		newCsiClusterConfigEntry.ReadAffinity.CrushLocationLabels = clusterInfo.CSIDriverSpec.ReadAffinity.CrushLocationLabels
+
+		newCsiClusterConfigEntry.CephFS.KernelMountOptions = clusterInfo.CSIDriverSpec.CephFS.KernelMountOptions
+		newCsiClusterConfigEntry.CephFS.FuseMountOptions = clusterInfo.CSIDriverSpec.CephFS.FuseMountOptions
+	}
+
 	configMutex.Lock()
 	defer configMutex.Unlock()
 
@@ -255,10 +338,7 @@ func SaveClusterConfig(clientset kubernetes.Interface, clusterNamespace string, 
 	configMap, err := clientset.CoreV1().ConfigMaps(csiNamespace).Get(clusterInfo.Context, ConfigName, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			err = CreateCsiConfigMap(clusterInfo.Context, csiNamespace, clientset, clusterInfo.OwnerInfo)
-			if err != nil {
-				return errors.Wrap(err, "failed creating csi config map")
-			}
+			return errors.Wrap(err, "waiting for CSI config map to be created")
 		}
 		return errors.Wrap(err, "failed to fetch current csi config map")
 	}
@@ -269,7 +349,7 @@ func SaveClusterConfig(clientset kubernetes.Interface, clusterNamespace string, 
 		currData = "[]"
 	}
 
-	newData, err := updateCsiClusterConfig(currData, clusterNamespace, newCsiClusterConfigEntry)
+	newData, err := updateCsiClusterConfig(currData, clusterID, clusterNamespace, newCsiClusterConfigEntry)
 	if err != nil {
 		return errors.Wrap(err, "failed to update csi config map data")
 	}
@@ -286,7 +366,8 @@ func SaveClusterConfig(clientset kubernetes.Interface, clusterNamespace string, 
 // updateCSIDriverOptions updates the CSI driver options, including read affinity, kernel mount options
 // and fuse mount options, for all entries belonging to the same cluster.
 func updateCSIDriverOptions(curr, clusterKey string,
-	csiDriverOptions *cephv1.CSIDriverSpec) (string, error) {
+	csiDriverOptions *cephv1.CSIDriverSpec,
+) (string, error) {
 	cc, err := parseCsiClusterConfig(curr)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to parse current csi cluster config")
@@ -295,19 +376,15 @@ func updateCSIDriverOptions(curr, clusterKey string,
 	for i := range cc {
 		// If the clusterID belongs to the same cluster, update the entry.
 		if clusterKey == cc[i].Namespace {
-			cc[i].ReadAffinity = &csiDriverOptions.ReadAffinity
-			if cc[i].CephFS == nil {
-				cc[i].CephFS = &CsiCephFSSpec{
-					KernelMountOptions: csiDriverOptions.CephFS.KernelMountOptions,
-					FuseMountOptions:   csiDriverOptions.CephFS.FuseMountOptions,
-				}
-			} else {
-				cc[i].CephFS.KernelMountOptions = csiDriverOptions.CephFS.KernelMountOptions
-				cc[i].CephFS.FuseMountOptions = csiDriverOptions.CephFS.FuseMountOptions
-			}
+			cc[i].ReadAffinity.Enabled = csiDriverOptions.ReadAffinity.Enabled
+			cc[i].ReadAffinity.CrushLocationLabels = csiDriverOptions.ReadAffinity.CrushLocationLabels
+
+			cc[i].CephFS.KernelMountOptions = csiDriverOptions.CephFS.KernelMountOptions
+			cc[i].CephFS.FuseMountOptions = csiDriverOptions.CephFS.FuseMountOptions
 		}
 	}
 
+	updateNetNamespaceFilePath(clusterKey, cc)
 	return formatCsiClusterConfig(cc)
 }
 

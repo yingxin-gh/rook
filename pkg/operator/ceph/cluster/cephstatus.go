@@ -173,7 +173,7 @@ func (c *cephStatusChecker) configureHealthSettings(status cephclient.CephStatus
 	}
 }
 
-// updateStatus updates an object with a given status
+// updateCephStatus updates an object with a given status
 func (c *cephStatusChecker) updateCephStatus(status *cephclient.CephStatus, condition cephv1.ConditionType, reason cephv1.ConditionReason, message string, conditionStatus v1.ConditionStatus) {
 	clusterName := c.clusterInfo.NamespacedName()
 	cephCluster, err := c.context.RookClientset.CephV1().CephClusters(clusterName.Namespace).Get(c.clusterInfo.Context, clusterName.Name, metav1.GetOptions{})
@@ -288,7 +288,7 @@ func cephStatusOnError(errorMessage string) *cephclient.CephStatus {
 	}
 }
 
-// forceDeleteStuckPodsOnNotReadyNodes lists all the nodes that are in NotReady state and
+// forceDeleteStuckRookPodsOnNotReadyNodes lists all the nodes that are in NotReady state and
 // gets all the pods on the failed node and force delete the pods stuck in terminating state.
 func (c *cephStatusChecker) forceDeleteStuckRookPodsOnNotReadyNodes(ctx context.Context) error {
 	nodes, err := k8sutil.GetNotReadyKubernetesNodes(ctx, c.context.Clientset)
@@ -314,11 +314,8 @@ func (c *cephStatusChecker) getRookPodsOnNode(node string) ([]v1.Pod, error) {
 	appLabels := []string{
 		"csi-rbdplugin-provisioner",
 		"csi-rbdplugin",
-		"csi-rbdplugin-holder",
-		"csi-cephfsplugin-holder",
 		"csi-cephfsplugin-provisioner",
 		"csi-cephfsplugin",
-		"csi-nfsplugin-holder",
 		"csi-nfsplugin-provisioner",
 		"csi-nfsplugin",
 		"rook-ceph-operator",

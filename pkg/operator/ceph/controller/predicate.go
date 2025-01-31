@@ -436,6 +436,34 @@ func WatchControllerPredicate() predicate.Funcs {
 				if isUpgrade {
 					return true
 				}
+
+			case *cephv1.CephCOSIDriver:
+				objNew := e.ObjectNew.(*cephv1.CephCOSIDriver)
+				namespacedName := fmt.Sprintf("%s/%s", objNew.Namespace, objNew.Name)
+				logger.Debug("update event on CephCOSIDriver %q CR", namespacedName)
+				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+				IsDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
+				if IsDoNotReconcile {
+					logger.Debugf("object %q matched on update but %q label is set, doing nothing",
+						namespacedName, DoNotReconcileLabelName)
+					return false
+				}
+				diff := cmp.Diff(objOld.Spec, objNew.Spec)
+				if diff != "" {
+					logger.Infof("CephCOSIDriver CR has changed for %q. diff=%s", namespacedName, diff)
+					return true
+				} else if objectToBeDeleted(objOld, objNew) {
+					logger.Debugf("CephCOSIDriver CR %q is going be deleted", namespacedName)
+					return true
+				} else if objOld.GetGeneration() != objNew.GetGeneration() {
+					logger.Debugf("skipping CephCOSIDriver resource %q update with unchanged spec", namespacedName)
+				}
+				// Handling upgrades
+				isUpgrade := isUpgrade(objOld.GetLabels(), objNew.GetLabels())
+				if isUpgrade {
+					return true
+				}
+
 			}
 			return false
 		},
@@ -521,8 +549,8 @@ func WatchPredicateForNonCRDObject(owner runtime.Object, scheme *runtime.Scheme)
 					return false
 				}
 
-				// If the resource is a canary deployment we don't reconcile because it's ephemeral
-				if isCanary(e.Object) || isCrashCollector(e.Object) {
+				// If the resource is a canary, crash collector, or exporter we don't reconcile because it's ephemeral
+				if isCanary(e.Object) || isCrashCollector(e.Object) || isExporter(e.Object) {
 					return false
 				}
 
@@ -551,17 +579,17 @@ func WatchPredicateForNonCRDObject(owner runtime.Object, scheme *runtime.Scheme)
 				logger.Debugf("object %q matched on update", objectName)
 
 				// CONFIGMAP WHITELIST
-				// Only reconcile on rook-config-override CM changes
-				isCMTConfigOverride := isCMTConfigOverride(e.ObjectNew)
-				if isCMTConfigOverride {
-					logger.Debugf("do reconcile when the cm is %s", k8sutil.ConfigOverrideName)
+				// Only reconcile on rook-config-override CM changes if the configmap changed
+				shouldReconcileCM := shouldReconcileCM(e.ObjectOld, e.ObjectNew)
+				if shouldReconcileCM {
+					logger.Infof("reconcile due to updated configmap %s", k8sutil.ConfigOverrideName)
 					return true
 				}
 
 				// If the resource is a ConfigMap we don't reconcile
 				_, ok := e.ObjectNew.(*corev1.ConfigMap)
 				if ok {
-					logger.Debugf("do not reconcile on configmap that is not %q", k8sutil.ConfigOverrideName)
+					logger.Debugf("do not reconcile on configmap %q", objectName)
 					return false
 				}
 
@@ -693,6 +721,14 @@ func isCanary(obj runtime.Object) bool {
 }
 
 func isCrashCollector(obj runtime.Object) bool {
+	return isDeployment(obj, "rook-ceph-crashcollector")
+}
+
+func isExporter(obj runtime.Object) bool {
+	return isDeployment(obj, "rook-ceph-exporter")
+}
+
+func isDeployment(obj runtime.Object, appName string) bool {
 	// If not a deployment, let's not reconcile
 	d, ok := obj.(*appsv1.Deployment)
 	if !ok {
@@ -703,23 +739,35 @@ func isCrashCollector(obj runtime.Object) bool {
 	labels := d.GetLabels()
 
 	labelVal, labelKeyExist := labels["app"]
-	if labelKeyExist && labelVal == "rook-ceph-crashcollector" {
-		logger.Debugf("do not reconcile %q on crash collectors", d.Name)
+	if labelKeyExist && labelVal == appName {
+		logger.Debugf("do not reconcile %q on %s", d.Name, appName)
 		return true
 	}
 
 	return false
 }
 
-func isCMTConfigOverride(obj runtime.Object) bool {
+func shouldReconcileCM(objOld runtime.Object, objNew runtime.Object) bool {
 	// If not a ConfigMap, let's not reconcile
-	cm, ok := obj.(*corev1.ConfigMap)
+	cmNew, ok := objNew.(*corev1.ConfigMap)
 	if !ok {
 		return false
 	}
 
-	objectName := cm.GetName()
-	return objectName == k8sutil.ConfigOverrideName
+	// If not a ConfigMap, let's not reconcile
+	cmOld, ok := objOld.(*corev1.ConfigMap)
+	if !ok {
+		return false
+	}
+
+	objectName := cmNew.GetName()
+	if objectName != k8sutil.ConfigOverrideName {
+		return false
+	}
+	if !reflect.DeepEqual(cmNew.Data, cmOld.Data) {
+		return true
+	}
+	return false
 }
 
 func isCMToIgnoreOnDelete(obj runtime.Object) bool {
