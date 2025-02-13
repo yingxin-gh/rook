@@ -20,7 +20,14 @@ set -xEe
 if [ -z "$DAEMON_TO_VALIDATE" ]; then
   DAEMON_TO_VALIDATE=all
 fi
-OSD_COUNT=$2
+# The second script arg is optional and depends on the daemon
+if [ "$DAEMON_TO_VALIDATE" == "rgw" ]; then
+  export OBJECT_STORE_NAME=$2
+else
+  export OSD_COUNT=$2
+  # default to the name of the object store from object-a.yaml
+  export OBJECT_STORE_NAME=store-a
+fi
 
 #############
 # FUNCTIONS #
@@ -63,7 +70,7 @@ function test_demo_osd {
 
 function test_demo_rgw {
   timeout 360 bash -x <<-'EOF'
-    until [[ "$(kubectl -n rook-ceph get pods -l app=rook-ceph-rgw -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}')" == "True" ]]; do
+    until [[ "$(kubectl -n rook-ceph get pods -l rgw=$OBJECT_STORE_NAME -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}')" == "True" ]]; do
       echo "waiting for rgw pods to be ready"
       sleep 5
     done
@@ -96,25 +103,10 @@ function test_demo_pool {
 
 function test_csi {
   timeout 360 bash -x <<-'EOF'
-    echo $IS_POD_NETWORK
-    echo $IS_MULTUS
-    if [ -z "$IS_POD_NETWORK" ]; then
-      until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c ^csi-)" -eq 6 ]]; do
-        echo "waiting for csi pods to be ready"
-        sleep 5
-      done
-    else
-      until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c ^csi-)" -eq 9 ]]; do
-        echo "waiting for csi pods to be ready with multus or pod networking"
-        sleep 5
-      done
-    fi
-    if [ -n "$IS_MULTUS" ]; then
-      echo "verifying csi holder interfaces (multus ones must be present)"
-      kubectl -n rook-ceph exec -t ds/csi-rbdplugin-holder-my-cluster -- grep eth0 /proc/net/dev
-      kubectl -n rook-ceph exec -t ds/csi-cephfsplugin-holder-my-cluster -- grep eth0 /proc/net/dev
-      kubectl -n rook-ceph exec -t ds/csi-nfsplugin-holder-my-cluster -- grep eth0 /proc/net/dev
-    fi
+    until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c ^csi-)" -eq 6 ]]; do
+      echo "waiting for csi pods to be ready"
+      sleep 5
+    done
 EOF
 }
 

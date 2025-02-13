@@ -45,7 +45,7 @@ func TestDeploymentTemplate(t *testing.T) {
 }
 
 func TestGetPortFromConfig(t *testing.T) {
-	var key = "TEST_CSI_PORT_ENV"
+	key := "TEST_CSI_PORT_ENV"
 	var defaultPort uint16 = 8000
 	data := map[string]string{}
 
@@ -127,6 +127,15 @@ func Test_applyVolumeToPodSpec(t *testing.T) {
 	applyVolumeToPodSpec(config, configKey, &ds.Spec.Template.Spec)
 
 	assert.Len(t, ds.Spec.Template.Spec.Volumes, defaultVolumes)
+
+	// enable csi logrotate, two more volume mounts get added
+	tp.CSILogRotation = true
+	ds, err = templateToDaemonSet(dsName, RBDPluginTemplatePath, tp)
+	assert.Nil(t, err)
+	applyVolumeToPodSpec(config, configKey, &ds.Spec.Template.Spec)
+	assert.Len(t, ds.Spec.Template.Spec.Volumes, defaultVolumes+2)
+	tp.CSILogRotation = false
+
 	// add new volume
 	volumes := []corev1.Volume{
 		{
@@ -156,7 +165,8 @@ func Test_applyVolumeToPodSpec(t *testing.T) {
 	assert.Len(t, ds.Spec.Template.Spec.Volumes, defaultVolumes+2)
 	// override existing volume configuration
 	volumes[1].VolumeSource = corev1.VolumeSource{
-		HostPath: &corev1.HostPathVolumeSource{Path: "/run/test/run"}}
+		HostPath: &corev1.HostPathVolumeSource{Path: "/run/test/run"},
+	}
 	volumeRaw, err = yaml.Marshal(volumes)
 	assert.Nil(t, err)
 	config[configKey] = string(volumeRaw)
@@ -178,7 +188,6 @@ func Test_applyVolumeToPodSpec(t *testing.T) {
 	assert.Nil(t, err)
 	applyVolumeToPodSpec(config, configKey, &ds.Spec.Template.Spec)
 	assert.Len(t, ds.Spec.Template.Spec.Volumes, defaultVolumes+1)
-
 }
 
 func Test_applyVolumeMountToContainer(t *testing.T) {
@@ -198,6 +207,15 @@ func Test_applyVolumeMountToContainer(t *testing.T) {
 	applyVolumeMountToContainer(config, configKey, rbdContainerName, &ds.Spec.Template.Spec)
 
 	assert.Len(t, ds.Spec.Template.Spec.Containers[1].VolumeMounts, defaultVolumes)
+
+	// enable csi logrotate, one more volumes get added
+	tp.CSILogRotation = true
+	ds, err = templateToDaemonSet(dsName, RBDPluginTemplatePath, tp)
+	assert.Nil(t, err)
+	applyVolumeMountToContainer(config, configKey, rbdContainerName, &ds.Spec.Template.Spec)
+	assert.Len(t, ds.Spec.Template.Spec.Containers[1].VolumeMounts, defaultVolumes+1)
+	tp.CSILogRotation = false
+
 	// add new volume mount
 	volumeMounts := []corev1.VolumeMount{
 		{
@@ -248,7 +266,6 @@ func Test_applyVolumeMountToContainer(t *testing.T) {
 	assert.Nil(t, err)
 	applyVolumeMountToContainer(config, configKey, rbdContainerName, &ds.Spec.Template.Spec)
 	assert.Len(t, ds.Spec.Template.Spec.Containers[1].VolumeMounts, defaultVolumes+1)
-
 }
 
 func Test_getImage(t *testing.T) {
@@ -267,7 +284,7 @@ func Test_getImage(t *testing.T) {
 			args: args{
 				data:         map[string]string{},
 				settingName:  "ROOK_CSI_CEPH_IMAGE",
-				defaultImage: "quay.io/cephcsi/cephcsi:v3.9.0",
+				defaultImage: "quay.io/cephcsi/cephcsi:v3.13.0",
 			},
 			want: DefaultCSIPluginImage,
 		},
@@ -278,7 +295,7 @@ func Test_getImage(t *testing.T) {
 					"ROOK_CSI_CEPH_IMAGE": "registry.io/private/cephcsi:v8",
 				},
 				settingName:  "ROOK_CSI_CEPH_IMAGE",
-				defaultImage: "quay.io/cephcsi/cephcsi:v3.9.0",
+				defaultImage: "quay.io/cephcsi/cephcsi:v3.11.0",
 			},
 			want: "registry.io/private/cephcsi:v8",
 		},
@@ -289,9 +306,9 @@ func Test_getImage(t *testing.T) {
 					"ROOK_CSI_CEPH_IMAGE": "registry.io/private/cephcsi",
 				},
 				settingName:  "ROOK_CSI_CEPH_IMAGE",
-				defaultImage: "quay.io/cephcsi/cephcsi:v3.9.0",
+				defaultImage: "quay.io/cephcsi/cephcsi:v3.11.0",
 			},
-			want: "registry.io/private/cephcsi:v3.9.0",
+			want: "registry.io/private/cephcsi:v3.11.0",
 		},
 	}
 	for _, tt := range tests {

@@ -92,7 +92,7 @@ func TestNFSSecuritySpec_Validate(t *testing.T) {
 			withSSSD(&SSSDSpec{
 				Sidecar: &SSSDSidecar{
 					Image:           "myimage",
-					AdditionalFiles: []SSSDSidecarAdditionalFile{},
+					AdditionalFiles: AdditionalVolumeMounts{},
 				},
 			}),
 			isOkay},
@@ -100,7 +100,7 @@ func TestNFSSecuritySpec_Validate(t *testing.T) {
 			withSSSD(&SSSDSpec{
 				Sidecar: &SSSDSidecar{
 					Image: "myimage",
-					AdditionalFiles: []SSSDSidecarAdditionalFile{
+					AdditionalFiles: AdditionalVolumeMounts{
 						{SubPath: "one", VolumeSource: configMapVolumeSource},
 						{SubPath: "two", VolumeSource: configMapVolumeSource},
 						{SubPath: "three", VolumeSource: configMapVolumeSource},
@@ -112,7 +112,7 @@ func TestNFSSecuritySpec_Validate(t *testing.T) {
 			withSSSD(&SSSDSpec{
 				Sidecar: &SSSDSidecar{
 					Image: "myimage",
-					AdditionalFiles: []SSSDSidecarAdditionalFile{
+					AdditionalFiles: AdditionalVolumeMounts{
 						{SubPath: "one", VolumeSource: configMapVolumeSource},
 						{SubPath: "", VolumeSource: configMapVolumeSource},
 						{SubPath: "three", VolumeSource: configMapVolumeSource},
@@ -124,7 +124,7 @@ func TestNFSSecuritySpec_Validate(t *testing.T) {
 			withSSSD(&SSSDSpec{
 				Sidecar: &SSSDSidecar{
 					Image: "myimage",
-					AdditionalFiles: []SSSDSidecarAdditionalFile{
+					AdditionalFiles: AdditionalVolumeMounts{
 						{SubPath: "one", VolumeSource: configMapVolumeSource},
 						{SubPath: "two", VolumeSource: configMapVolumeSource},
 						{SubPath: "one", VolumeSource: configMapVolumeSource},
@@ -136,7 +136,7 @@ func TestNFSSecuritySpec_Validate(t *testing.T) {
 			withSSSD(&SSSDSpec{
 				Sidecar: &SSSDSidecar{
 					Image: "myimage",
-					AdditionalFiles: []SSSDSidecarAdditionalFile{
+					AdditionalFiles: AdditionalVolumeMounts{
 						{SubPath: "one", VolumeSource: configMapVolumeSource},
 						{SubPath: "", VolumeSource: &ConfigFileVolumeSource{}},
 						{SubPath: "three", VolumeSource: configMapVolumeSource},
@@ -147,7 +147,7 @@ func TestNFSSecuritySpec_Validate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := tt.security.Validate(); (err != nil) != tt.wantErr {
+			if err := tt.security.Validate(); (err != nil) != tt.wantErr {
 				t.Errorf("NFSSecuritySpec.Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})

@@ -42,8 +42,8 @@ const (
 	monitoringPath                   = "/etc/ceph-monitoring/"
 	serviceMonitorFile               = "exporter-service-monitor.yaml"
 	sockDir                          = "/run/ceph"
-	perfCountersPrioLimit            = "5"
-	statsPeriod                      = "5"
+	defaultPrioLimit                 = "5"
+	defaultStatsPeriod               = "5"
 	DefaultMetricsPort        uint16 = 9926
 	exporterServiceMetricName        = "ceph-exporter-http-metrics"
 	exporterKeyringUsername          = "client.ceph-exporter"
@@ -67,9 +67,9 @@ func (r *ReconcileNode) createOrUpdateCephExporter(node corev1.Node, tolerations
 		return controllerutil.OperationResultNone, nil
 	}
 
-	nodeHostnameLabel, ok := node.Labels[corev1.LabelHostname]
+	nodeHostnameLabel, ok := node.Labels[k8sutil.LabelHostname()]
 	if !ok {
-		return controllerutil.OperationResultNone, errors.Errorf("label key %q does not exist on node %q", corev1.LabelHostname, node.GetName())
+		return controllerutil.OperationResultNone, errors.Errorf("label key %q does not exist on node %q", k8sutil.LabelHostname(), node.GetName())
 	}
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -77,6 +77,7 @@ func (r *ReconcileNode) createOrUpdateCephExporter(node corev1.Node, tolerations
 			Namespace: cephCluster.GetNamespace(),
 		},
 	}
+	deploy.Spec.RevisionHistoryLimit = controller.RevisionHistoryLimit()
 	err := controllerutil.SetControllerReference(&cephCluster, deploy, r.scheme)
 	if err != nil {
 		return controllerutil.OperationResultNone, errors.Errorf("failed to set owner reference of ceph-exporter deployment %q", deploy.Name)
@@ -90,20 +91,20 @@ func (r *ReconcileNode) createOrUpdateCephExporter(node corev1.Node, tolerations
 
 		// labels for the pod, the deployment, and the deploymentSelector
 		deploymentLabels := map[string]string{
-			corev1.LabelHostname: nodeHostnameLabel,
-			k8sutil.AppAttr:      cephExporterAppName,
-			NodeNameLabel:        node.GetName(),
+			k8sutil.LabelHostname(): nodeHostnameLabel,
+			k8sutil.AppAttr:         cephExporterAppName,
+			NodeNameLabel:           node.GetName(),
 		}
 		deploymentLabels[controller.DaemonIDLabel] = "exporter"
 		deploymentLabels[k8sutil.ClusterAttr] = cephCluster.GetNamespace()
 
 		selectorLabels := map[string]string{
-			corev1.LabelHostname: nodeHostnameLabel,
-			k8sutil.AppAttr:      cephExporterAppName,
-			NodeNameLabel:        node.GetName(),
+			k8sutil.LabelHostname(): nodeHostnameLabel,
+			k8sutil.AppAttr:         cephExporterAppName,
+			NodeNameLabel:           node.GetName(),
 		}
 
-		nodeSelector := map[string]string{corev1.LabelHostname: nodeHostnameLabel}
+		nodeSelector := map[string]string{k8sutil.LabelHostname(): nodeHostnameLabel}
 
 		// Deployment selector is immutable so we set this value only if
 		// a new object is going to be created
@@ -143,6 +144,8 @@ func (r *ReconcileNode) createOrUpdateCephExporter(node corev1.Node, tolerations
 				Volumes:                       volumes,
 				PriorityClassName:             cephv1.GetCephExporterPriorityClassName(cephCluster.Spec.PriorityClassNames),
 				TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
+				SecurityContext:               &corev1.PodSecurityContext{},
+				ServiceAccountName:            k8sutil.DefaultServiceAccount,
 			},
 		}
 		cephv1.GetCephExporterAnnotations(cephCluster.Spec.Annotations).ApplyToObjectMeta(&deploy.Spec.Template.ObjectMeta)
@@ -178,10 +181,15 @@ func getCephExporterDaemonContainer(cephCluster cephv1.CephCluster, cephVersion 
 	exporterEnvVar := generateExporterEnvVar()
 	envVars := append(controller.DaemonEnvVars(&cephCluster.Spec), exporterEnvVar)
 
+	prioLimit, statsPeriod := defaultPrioLimit, defaultStatsPeriod
+	if cephCluster.Spec.Monitoring.Exporter != nil {
+		prioLimit = strconv.Itoa(int(cephCluster.Spec.Monitoring.Exporter.PerfCountersPrioLimit))
+		statsPeriod = strconv.Itoa(int(cephCluster.Spec.Monitoring.Exporter.StatsPeriodSeconds))
+	}
 	args := []string{
 		"--sock-dir", sockDir,
 		"--port", strconv.Itoa(int(DefaultMetricsPort)),
-		"--prio-limit", perfCountersPrioLimit,
+		"--prio-limit", prioLimit,
 		"--stats-period", statsPeriod,
 	}
 
@@ -261,14 +269,15 @@ func EnableCephExporterServiceMonitor(context *clusterd.Context, cephCluster cep
 
 func applyCephExporterLabels(cephCluster cephv1.CephCluster, serviceMonitor *monitoringv1.ServiceMonitor) {
 	if cephCluster.Spec.Labels != nil {
+		cephv1.GetMonitoringLabels(cephCluster.Spec.Labels).OverwriteApplyToObjectMeta(&serviceMonitor.ObjectMeta)
 		if cephExporterLabels, ok := cephCluster.Spec.Labels["exporter"]; ok {
 			if managedBy, ok := cephExporterLabels["rook.io/managedBy"]; ok {
 				relabelConfig := monitoringv1.RelabelConfig{
 					TargetLabel: "managedBy",
-					Replacement: managedBy,
+					Replacement: &managedBy,
 				}
 				serviceMonitor.Spec.Endpoints[0].RelabelConfigs = append(
-					serviceMonitor.Spec.Endpoints[0].RelabelConfigs, &relabelConfig)
+					serviceMonitor.Spec.Endpoints[0].RelabelConfigs, relabelConfig)
 			} else {
 				logger.Info("rook.io/managedBy not specified in ceph-exporter labels")
 			}

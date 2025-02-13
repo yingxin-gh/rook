@@ -33,7 +33,6 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	oposd "github.com/rook/rook/pkg/operator/ceph/cluster/osd"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/util/sys"
 )
 
@@ -180,10 +179,6 @@ func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topolo
 	// set the initial orchestration status
 	status := oposd.OrchestrationStatus{Status: oposd.OrchestrationStatusOrchestrating}
 	oposd.UpdateNodeOrPVCStatus(agent.clusterInfo.Context, agent.kv, agent.nodeName, status)
-
-	if err := client.WriteCephConfig(context, agent.clusterInfo); err != nil {
-		return errors.Wrap(err, "failed to generate ceph config")
-	}
 
 	logger.Infof("discovering hardware")
 
@@ -395,13 +390,6 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			device, err := clusterd.PopulateDeviceUdevInfo(device.Name, context.Executor, device)
 			if err != nil {
 				logger.Errorf("failed to get udev info of partition %q. %v", device.Name, err)
-				continue
-			}
-		}
-
-		if device.Type == sys.LoopType {
-			if !agent.clusterInfo.CephVersion.IsAtLeast(cephver.CephVersion{Major: 17, Minor: 2, Extra: 4}) {
-				logger.Infof("partition %q is not picked because loop devices are not allowed on Ceph clusters older than v17.2.4", device.Name)
 				continue
 			}
 		}

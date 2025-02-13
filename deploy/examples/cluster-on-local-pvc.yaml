@@ -162,6 +162,7 @@ metadata:
   name: rook-ceph
   namespace: rook-ceph # namespace:cluster
 spec:
+  # If there are multiple clusters, the directory must be unique for each cluster.
   dataDirHostPath: /var/lib/rook
   mon:
     count: 3
@@ -173,15 +174,12 @@ spec:
           requests:
             storage: 10Gi
   cephVersion:
-    image: quay.io/ceph/ceph:v17.2.6
+    image: quay.io/ceph/ceph:v19.2.0
     allowUnsupported: false
   skipUpgradeChecks: false
   continueUpgradeAfterChecksEvenIfNotHealthy: false
   mgr:
     count: 1
-    modules:
-      - name: pg_autoscaler
-        enabled: true
   dashboard:
     enabled: true
     ssl: true
@@ -226,7 +224,6 @@ spec:
         resources:
         # These are the OSD daemon limits. For OSD prepare limits, see the separate section below for "prepareosd" resources
         #   limits:
-        #     cpu: "500m"
         #     memory: "4Gi"
         #   requests:
         #     cpu: "500m"
@@ -250,10 +247,7 @@ spec:
     onlyApplyOSDPlacement: false
   resources:
   #  prepareosd:
-  #    limits:
-  #      cpu: "200m"
-  #      memory: "200Mi"
-  #   requests:
+  #    requests:
   #      cpu: "200m"
   #      memory: "200Mi"
   priorityClassNames:

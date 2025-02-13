@@ -61,6 +61,7 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 			Containers: []v1.Container{
 				c.makeMgrDaemonContainer(mgrConfig),
 			},
+			SecurityContext:    &v1.PodSecurityContext{},
 			ServiceAccountName: serviceAccountName,
 			RestartPolicy:      v1.RestartPolicyAlways,
 			Volumes:            volumes,
@@ -74,10 +75,22 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 	if c.spec.Mgr.Count > 1 {
 		podSpec.Spec.Containers = append(podSpec.Spec.Containers, c.makeMgrSidecarContainer(mgrConfig))
 		matchLabels := controller.AppLabels(AppName, c.clusterInfo.Namespace)
-		podSpec.Spec.Volumes = append(podSpec.Spec.Volumes, mon.CephSecretVolume())
+		// append ceph secret volume and some empty volumes needed by the mgr sidecar
+		podSpec.Spec.Volumes = append(podSpec.Spec.Volumes,
+			v1.Volume{
+				Name: "rook-config",
+				VolumeSource: v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{},
+				}},
+			v1.Volume{
+				Name: "default-config-dir",
+				VolumeSource: v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{},
+				}},
+			mon.CephSecretVolume())
 
 		// Stretch the mgrs across hosts by default, or across a bigger failure domain for when zones are required like in case of stretched cluster
-		topologyKey := v1.LabelHostname
+		topologyKey := k8sutil.LabelHostname()
 		if c.spec.ZonesRequired() {
 			topologyKey = mon.GetFailureDomainLabel(c.spec)
 		}
@@ -116,6 +129,7 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 			Labels:    c.getPodLabels(mgrConfig, true),
 		},
 		Spec: apps.DeploymentSpec{
+			RevisionHistoryLimit: controller.RevisionHistoryLimit(),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: c.getPodLabels(mgrConfig, false),
 			},
@@ -179,7 +193,7 @@ func (c *Cluster) makeMgrDaemonContainer(mgrConfig *mgrConfig) v1.Container {
 			},
 			{
 				Name:          "dashboard",
-				ContainerPort: int32(c.dashboardInternalPort()),
+				ContainerPort: int32(c.dashboardInternalPort()), // nolint:gosec // G115 port numbers will not overflow an int32
 				Protocol:      v1.ProtocolTCP,
 			},
 		},
@@ -225,6 +239,18 @@ func (c *Cluster) makeMgrSidecarContainer(mgrConfig *mgrConfig) v1.Container {
 		{Name: "ROOK_CEPH_VERSION", Value: "ceph version " + c.clusterInfo.CephVersion.String()},
 	}
 
+	volumeMounts := []v1.VolumeMount{
+		{
+			MountPath: "/var/lib/rook",
+			Name:      "rook-config",
+		},
+		{
+			MountPath: "/etc/ceph",
+			Name:      "default-config-dir",
+		},
+	}
+	volumeMounts = append(volumeMounts, mon.CephSecretVolumeMount())
+
 	return v1.Container{
 		Args:            []string{"ceph", "mgr", "watch-active"},
 		Name:            "watch-active",
@@ -232,8 +258,8 @@ func (c *Cluster) makeMgrSidecarContainer(mgrConfig *mgrConfig) v1.Container {
 		ImagePullPolicy: controller.GetContainerImagePullPolicy(c.spec.CephVersion.ImagePullPolicy),
 		Env:             envVars,
 		Resources:       cephv1.GetMgrSidecarResources(c.spec.Resources),
-		SecurityContext: controller.PrivilegedContext(true),
-		VolumeMounts:    []v1.VolumeMount{mon.CephSecretVolumeMount()},
+		SecurityContext: controller.PodSecurityContext(),
+		VolumeMounts:    volumeMounts,
 	}
 }
 
@@ -311,15 +337,17 @@ func (c *Cluster) makeDashboardService(name string) (*v1.Service, error) {
 			Ports: []v1.ServicePort{
 				{
 					Name: portName,
-					Port: int32(c.dashboardPublicPort()),
+					Port: int32(c.dashboardPublicPort()), // nolint:gosec // G115 port numbers will not overflow an int32
 					TargetPort: intstr.IntOrString{
-						IntVal: int32(c.dashboardInternalPort()),
+						IntVal: int32(c.dashboardInternalPort()), // nolint:gosec // G115 port numbers will not overflow an int32
 					},
 					Protocol: v1.ProtocolTCP,
 				},
 			},
 		},
 	}
+	cephv1.GetDashboardAnnotations(c.spec.Annotations).ApplyToObjectMeta(&svc.ObjectMeta)
+	cephv1.GetDashboardLabels(c.spec.Labels).ApplyToObjectMeta(&svc.ObjectMeta)
 	err := c.clusterInfo.OwnerInfo.SetControllerReference(svc)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to set owner reference to dashboard service %q", svc.Name)

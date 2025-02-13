@@ -47,36 +47,42 @@ The following table lists the configurable parameters of the rook-operator chart
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `admissionController` | Set tolerations and nodeAffinity [^1] for admission controller pod. The admission controller would be best to start on the same nodes as other ceph daemons. | `nil` |
 | `allowLoopDevices` | If true, loop devices are allowed to be used for osds in test clusters | `false` |
 | `annotations` | Pod annotations | `{}` |
 | `cephCommandsTimeoutSeconds` | The timeout for ceph commands in seconds | `"15"` |
 | `containerSecurityContext` | Set the container security context for the operator | `{"capabilities":{"drop":["ALL"]},"runAsGroup":2016,"runAsNonRoot":true,"runAsUser":2016}` |
 | `crds.enabled` | Whether the helm chart should create and update the CRDs. If false, the CRDs must be managed independently with deploy/examples/crds.yaml. **WARNING** Only set during first deployment. If later disabled the cluster may be DESTROYED. If the CRDs are deleted in this case, see [the disaster recovery guide](https://rook.io/docs/rook/latest/Troubleshooting/disaster-recovery/#restoring-crds-after-deletion) to restore them. | `true` |
-| `csi.allowUnsupportedVersion` | Allow starting an unsupported ceph-csi image | `false` |
-| `csi.attacher.image` | Kubernetes CSI Attacher image | `registry.k8s.io/sig-storage/csi-attacher:v4.4.2` |
+| `csi.attacher.repository` | Kubernetes CSI Attacher image repository | `"registry.k8s.io/sig-storage/csi-attacher"` |
+| `csi.attacher.tag` | Attacher image tag | `"v4.8.0"` |
 | `csi.cephFSAttachRequired` | Whether to skip any attach operation altogether for CephFS PVCs. See more details [here](https://kubernetes-csi.github.io/docs/skip-attach.html#skip-attach-with-csi-driver-object). If cephFSAttachRequired is set to false it skips the volume attachments and makes the creation of pods using the CephFS PVC fast. **WARNING** It's highly discouraged to use this for CephFS RWO volumes. Refer to this [issue](https://github.com/kubernetes/kubernetes/issues/103305) for more details. | `true` |
 | `csi.cephFSFSGroupPolicy` | Policy for modifying a volume's ownership or permissions when the CephFS PVC is being mounted. supported values are documented at https://kubernetes-csi.github.io/docs/support-fsgroup.html | `"File"` |
 | `csi.cephFSKernelMountOptions` | Set CephFS Kernel mount options to use https://docs.ceph.com/en/latest/man/8/mount.ceph/#options. Set to "ms_mode=secure" when connections.encrypted is enabled in CephCluster CR | `nil` |
 | `csi.cephFSPluginUpdateStrategy` | CSI CephFS plugin daemonset update strategy, supported values are OnDelete and RollingUpdate | `RollingUpdate` |
 | `csi.cephFSPluginUpdateStrategyMaxUnavailable` | A maxUnavailable parameter of CSI cephFS plugin daemonset update strategy. | `1` |
-| `csi.cephcsi.image` | Ceph CSI image | `quay.io/cephcsi/cephcsi:v3.9.0` |
+| `csi.cephcsi.repository` | Ceph CSI image repository | `"quay.io/cephcsi/cephcsi"` |
+| `csi.cephcsi.tag` | Ceph CSI image tag | `"v3.13.0"` |
 | `csi.cephfsLivenessMetricsPort` | CSI CephFS driver metrics port | `9081` |
 | `csi.cephfsPodLabels` | Labels to add to the CSI CephFS Deployments and DaemonSets Pods | `nil` |
 | `csi.clusterName` | Cluster name identifier to set as metadata on the CephFS subvolume and RBD images. This will be useful in cases like for example, when two container orchestrator clusters (Kubernetes/OCP) are using a single ceph cluster | `nil` |
 | `csi.csiAddons.enabled` | Enable CSIAddons | `false` |
-| `csi.csiAddons.image` | CSIAddons Sidecar image | `"quay.io/csiaddons/k8s-sidecar:v0.7.0"` |
+| `csi.csiAddons.repository` | CSIAddons sidecar image repository | `"quay.io/csiaddons/k8s-sidecar"` |
+| `csi.csiAddons.tag` | CSIAddons sidecar image tag | `"v0.11.0"` |
 | `csi.csiAddonsPort` | CSI Addons server port | `9070` |
 | `csi.csiCephFSPluginResource` | CEPH CSI CephFS plugin resource requirement list | see values.yaml |
 | `csi.csiCephFSPluginVolume` | The volume of the CephCSI CephFS plugin DaemonSet | `nil` |
 | `csi.csiCephFSPluginVolumeMount` | The volume mounts of the CephCSI CephFS plugin DaemonSet | `nil` |
 | `csi.csiCephFSProvisionerResource` | CEPH CSI CephFS provisioner resource requirement list | see values.yaml |
+| `csi.csiDriverNamePrefix` | CSI driver name prefix for cephfs, rbd and nfs. | `namespace name where rook-ceph operator is deployed` |
+| `csi.csiLeaderElectionLeaseDuration` | Duration in seconds that non-leader candidates will wait to force acquire leadership. | `137s` |
+| `csi.csiLeaderElectionRenewDeadline` | Deadline in seconds that the acting leader will retry refreshing leadership before giving up. | `107s` |
+| `csi.csiLeaderElectionRetryPeriod` | Retry period in seconds the LeaderElector clients should wait between tries of actions. | `26s` |
 | `csi.csiNFSPluginResource` | CEPH CSI NFS plugin resource requirement list | see values.yaml |
 | `csi.csiNFSProvisionerResource` | CEPH CSI NFS provisioner resource requirement list | see values.yaml |
 | `csi.csiRBDPluginResource` | CEPH CSI RBD plugin resource requirement list | see values.yaml |
 | `csi.csiRBDPluginVolume` | The volume of the CephCSI RBD plugin DaemonSet | `nil` |
 | `csi.csiRBDPluginVolumeMount` | The volume mounts of the CephCSI RBD plugin DaemonSet | `nil` |
 | `csi.csiRBDProvisionerResource` | CEPH CSI RBD provisioner resource requirement list csi-omap-generator resources will be applied only if `enableOMAPGenerator` is set to `true` | see values.yaml |
+| `csi.disableCsiDriver` | Disable the CSI driver. | `"false"` |
 | `csi.enableCSIEncryption` | Enable Ceph CSI PVC encryption support | `false` |
 | `csi.enableCSIHostNetwork` | Enable host networking for CSI CephFS and RBD nodeplugins. This may be necessary in some network configurations where the SDN does not provide access to an external cluster or there is significant drop in read/write performance | `true` |
 | `csi.enableCephfsDriver` | Enable Ceph CSI CephFS driver | `true` |
@@ -88,9 +94,12 @@ The following table lists the configurable parameters of the rook-operator chart
 | `csi.enablePluginSelinuxHostMount` | Enable Host mount for `/etc/selinux` directory for Ceph CSI nodeplugins | `false` |
 | `csi.enableRBDSnapshotter` | Enable Snapshotter in RBD provisioner pod | `true` |
 | `csi.enableRbdDriver` | Enable Ceph CSI RBD driver | `true` |
+| `csi.enableVolumeGroupSnapshot` | Enable volume group snapshot feature. This feature is enabled by default as long as the necessary CRDs are available in the cluster. | `true` |
 | `csi.forceCephFSKernelClient` | Enable Ceph Kernel clients on kernel < 4.17. If your kernel does not support quotas for CephFS you may want to disable this setting. However, this will cause an issue during upgrades with the FUSE client. See the [upgrade guide](https://rook.io/docs/rook/v1.2/ceph-upgrade.html) | `true` |
 | `csi.grpcTimeoutInSeconds` | Set GRPC timeout for csi containers (in seconds). It should be >= 120. If this value is not set or is invalid, it defaults to 150 | `150` |
 | `csi.imagePullPolicy` | Image pull policy | `"IfNotPresent"` |
+| `csi.kubeApiBurst` | Burst to use while communicating with the kubernetes apiserver. | `nil` |
+| `csi.kubeApiQPS` | QPS to use while communicating with the kubernetes apiserver. | `nil` |
 | `csi.kubeletDirPath` | Kubelet root directory path (if the Kubelet uses a different path for the `--root-dir` flag) | `/var/lib/kubelet` |
 | `csi.logLevel` | Set logging level for cephCSI containers maintained by the cephCSI. Supported values from 0 to 5. 0 for general useful logs, 5 for trace level verbosity. | `0` |
 | `csi.nfs.enabled` | Enable the nfs csi driver | `false` |
@@ -101,7 +110,8 @@ The following table lists the configurable parameters of the rook-operator chart
 | `csi.pluginNodeAffinity` | The node labels for affinity of the CephCSI RBD plugin DaemonSet [^1] | `nil` |
 | `csi.pluginPriorityClassName` | PriorityClassName to be set on csi driver plugin pods | `"system-node-critical"` |
 | `csi.pluginTolerations` | Array of tolerations in YAML format which will be added to CephCSI plugin DaemonSet | `nil` |
-| `csi.provisioner.image` | Kubernetes CSI provisioner image | `registry.k8s.io/sig-storage/csi-provisioner:v3.6.2` |
+| `csi.provisioner.repository` | Kubernetes CSI provisioner image repository | `"registry.k8s.io/sig-storage/csi-provisioner"` |
+| `csi.provisioner.tag` | Provisioner image tag | `"v5.1.0"` |
 | `csi.provisionerNodeAffinity` | The node labels for affinity of the CSI provisioner deployment [^1] | `nil` |
 | `csi.provisionerPriorityClassName` | PriorityClassName to be set on csi driver provisioner pods | `"system-cluster-critical"` |
 | `csi.provisionerReplicas` | Set replicas for csi provisioner deployment | `2` |
@@ -112,20 +122,21 @@ The following table lists the configurable parameters of the rook-operator chart
 | `csi.rbdPluginUpdateStrategy` | CSI RBD plugin daemonset update strategy, supported values are OnDelete and RollingUpdate | `RollingUpdate` |
 | `csi.rbdPluginUpdateStrategyMaxUnavailable` | A maxUnavailable parameter of CSI RBD plugin daemonset update strategy. | `1` |
 | `csi.rbdPodLabels` | Labels to add to the CSI RBD Deployments and DaemonSets Pods | `nil` |
-| `csi.readAffinity.crushLocationLabels` | Define which node labels to use as CRUSH location. This should correspond to the values set in the CRUSH map. | labels listed [here](../CRDs/Cluster/ceph-cluster-crd.md#osd-topology) |
-| `csi.readAffinity.enabled` | Enable read affinity for RBD volumes. Recommended to set to true if running kernel 5.8 or newer. | `false` |
-| `csi.registrar.image` | Kubernetes CSI registrar image | `registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.1` |
-| `csi.resizer.image` | Kubernetes CSI resizer image | `registry.k8s.io/sig-storage/csi-resizer:v1.9.2` |
+| `csi.registrar.repository` | Kubernetes CSI registrar image repository | `"registry.k8s.io/sig-storage/csi-node-driver-registrar"` |
+| `csi.registrar.tag` | Registrar image tag | `"v2.13.0"` |
+| `csi.resizer.repository` | Kubernetes CSI resizer image repository | `"registry.k8s.io/sig-storage/csi-resizer"` |
+| `csi.resizer.tag` | Resizer image tag | `"v1.13.1"` |
 | `csi.serviceMonitor.enabled` | Enable ServiceMonitor for Ceph CSI drivers | `false` |
-| `csi.serviceMonitor.interval` | Service monitor scrape interval | `"5s"` |
+| `csi.serviceMonitor.interval` | Service monitor scrape interval | `"10s"` |
 | `csi.serviceMonitor.labels` | ServiceMonitor additional labels | `{}` |
 | `csi.serviceMonitor.namespace` | Use a different namespace for the ServiceMonitor | `nil` |
 | `csi.sidecarLogLevel` | Set logging level for Kubernetes-csi sidecar containers. Supported values from 0 to 5. 0 for general useful logs (the default), 5 for trace level verbosity. | `0` |
-| `csi.snapshotter.image` | Kubernetes CSI snapshotter image | `registry.k8s.io/sig-storage/csi-snapshotter:v6.3.2` |
+| `csi.snapshotter.repository` | Kubernetes CSI snapshotter image repository | `"registry.k8s.io/sig-storage/csi-snapshotter"` |
+| `csi.snapshotter.tag` | Snapshotter image tag | `"v8.2.0"` |
 | `csi.topology.domainLabels` | domainLabels define which node labels to use as domains for CSI nodeplugins to advertise their domains | `nil` |
 | `csi.topology.enabled` | Enable topology based provisioning | `false` |
 | `currentNamespaceOnly` | Whether the operator should watch cluster CRD in its own namespace or not | `false` |
-| `disableAdmissionController` | Whether to disable the admission controller | `true` |
+| `customHostnameLabel` | Custom label to identify node hostname. If not set `kubernetes.io/hostname` will be used | `nil` |
 | `disableDeviceHotplug` | Disable automatic orchestration when new devices are discovered. | `false` |
 | `discover.nodeAffinity` | The node labels for affinity of `discover-agent` [^1] | `nil` |
 | `discover.podLabels` | Labels to add to the discover pods | `nil` |
@@ -137,25 +148,28 @@ The following table lists the configurable parameters of the rook-operator chart
 | `discoveryDaemonInterval` | Set the discovery daemon device discovery interval (default to 60m) | `"60m"` |
 | `enableDiscoveryDaemon` | Enable discovery daemon | `false` |
 | `enableOBCWatchOperatorNamespace` | Whether the OBC provisioner should watch on the operator namespace or not, if not the namespace of the cluster will be used | `true` |
+| `enforceHostNetwork` | Whether to create all Rook pods to run on the host network, for example in environments where a CNI is not enabled | `false` |
 | `hostpathRequiresPrivileged` | Runs Ceph Pods as privileged to be able to write to `hostPaths` in OpenShift with SELinux restrictions. | `false` |
 | `image.pullPolicy` | Image pull policy | `"IfNotPresent"` |
-| `image.repository` | Image | `"rook/ceph"` |
+| `image.repository` | Image | `"docker.io/rook/ceph"` |
 | `image.tag` | Image tag | `master` |
 | `imagePullSecrets` | imagePullSecrets option allow to pull docker images from private docker registry. Option will be passed to all service accounts. | `nil` |
 | `logLevel` | Global log level for the operator. Options: `ERROR`, `WARNING`, `INFO`, `DEBUG` | `"INFO"` |
 | `monitoring.enabled` | Enable monitoring. Requires Prometheus to be pre-installed. Enabling will also create RBAC rules to allow Operator to create ServiceMonitors | `false` |
 | `nodeSelector` | Kubernetes [`nodeSelector`](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector) to add to the Deployment. | `{}` |
+| `obcProvisionerNamePrefix` | Specify the prefix for the OBC provisioner in place of the cluster namespace | `ceph cluster namespace` |
 | `priorityClassName` | Set the priority class for the rook operator deployment if desired | `nil` |
 | `pspEnable` | If true, create & use PSP resources | `false` |
 | `rbacAggregate.enableOBCs` | If true, create a ClusterRole aggregated to [user facing roles](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#user-facing-roles) for objectbucketclaims | `false` |
 | `rbacEnable` | If true, create & use RBAC resources | `true` |
-| `resources` | Pod resource requests & limits | `{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}` |
+| `resources` | Pod resource requests & limits | `{"limits":{"memory":"512Mi"},"requests":{"cpu":"200m","memory":"128Mi"}}` |
+| `revisionHistoryLimit` | The revision history limit for all pods created by Rook. If blank, the K8s default is 10. | `nil` |
 | `scaleDownOperator` | If true, scale down the rook operator. This is useful for administrative actions where the rook operator must be scaled down, while using gitops style tooling to deploy your helm charts. | `false` |
 | `tolerations` | List of Kubernetes [`tolerations`](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/) to add to the Deployment. | `[]` |
 | `unreachableNodeTolerationSeconds` | Delay to use for the `node.kubernetes.io/unreachable` pod failure toleration to override the Kubernetes default of 5 minutes | `5` |
 | `useOperatorHostNetwork` | If true, run rook operator on the host network | `nil` |
 
-[^1]: `nodeAffinity` and `*NodeAffinity` options should have the format `"role=storage,rook; storage=ceph"` or `storage=;role=rook-example` or `storage=;` (_checks only for presence of key_)
+[^1]: `nodeAffinity` and `*NodeAffinity` options should have the format `"role=storage,rook; storage=ceph"` or `storage;role=rook-example` or `storage;` (_checks only for presence of key_)
 
 ### **Development Build**
 

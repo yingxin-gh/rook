@@ -18,17 +18,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   TestCephHelmSuite:
     if: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/master' && !contains(github.event.pull_request.labels.*.name, 'skip-ci') }}
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kubernetes-versions: ["v1.23.17", "v1.28.4"]
+        kubernetes-versions: ["v1.27.16", "v1.32.0"]
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
@@ -36,11 +39,11 @@ jobs:
         uses: ./.github/workflows/tmate_debug
         with:
           use-tmate: ${{ secrets.USE_TMATE }}
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
 
       - name: setup latest cluster resources
         uses: ./.github/workflows/integration-test-config-latest-k8s
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           kubernetes-version: ${{ matrix.kubernetes-versions }}
 
       - name: remove read permission from kube config file
@@ -51,7 +54,7 @@ jobs:
           tests/scripts/github-action-helper.sh collect_udev_logs_in_background
           tests/scripts/github-action-helper.sh create_helm_tag
           tests/scripts/helm.sh up
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ || /64G/ {print $1}'| head -1)
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
           SKIP_TEST_CLEANUP=false SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -failfast -run CephHelmSuite github.com/rook/rook/tests/integration
 
       - name: collect common logs
@@ -59,11 +62,10 @@ jobs:
         run: |
           export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
           export CLUSTER_NAMESPACE="helm-ns"
-          export OPERATOR_NAMESPACE="helm-ns-system"
           tests/scripts/collect-logs.sh
 
       - name: Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: failure()
         with:
           name: ceph-helm-suite-artifact-${{ matrix.kubernetes-versions }}

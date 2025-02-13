@@ -29,7 +29,6 @@ import (
 	cephutil "github.com/rook/rook/pkg/daemon/ceph/util"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
-	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,8 +46,6 @@ var (
 	timeZero                       = time.Duration(0)
 	// Check whether mons are on the same node once per operator restart since it's a rare scheduling condition
 	needToCheckMonsOnSameNode = true
-	// Version of Ceph where the arbiter failover is supported
-	arbiterFailoverSupportedCephVersion = version.CephVersion{Major: 16, Minor: 2, Extra: 7}
 )
 
 // HealthChecker aggregates the mon/cluster info needed to check the health of the monitors
@@ -367,30 +364,17 @@ func (c *Cluster) checkHealth(ctx context.Context) error {
 		}
 	}
 
-	// failover mons running on host path to use persistent volumes if VolumeClaimTemplate is set and vice versa
+	// failover any mons present in the mon fail over list
 	for _, mon := range c.ClusterInfo.Monitors {
-		if c.HasMonPathChanged(mon.Name) {
-			logger.Infof("fail over mon %q due to change in mon path", mon.Name)
+		if c.monsToFailover.Has(mon.Name) {
+			logger.Infof("fail over mon %q from the mon fail over list", mon.Name)
 			c.failMon(len(c.ClusterInfo.Monitors), desiredMonCount, mon.Name)
+			c.monsToFailover.Delete(mon.Name)
 			return nil
 		}
 	}
 
 	return nil
-}
-
-// HasMonPathChanged checks if the mon storage path has changed from host path to persistent volume or vice versa
-func (c *Cluster) HasMonPathChanged(mon string) bool {
-	var monPathChanged bool
-	if c.mapping.Schedule[mon] != nil && c.spec.Mon.VolumeClaimTemplate != nil {
-		logger.Infof("mon %q path has changed from host path to persistent volumes", mon)
-		monPathChanged = true
-	} else if c.mapping.Schedule[mon] == nil && c.spec.Mon.VolumeClaimTemplate == nil {
-		logger.Infof("mon %q path has changed from persistent volumes to host path", mon)
-		monPathChanged = true
-	}
-
-	return monPathChanged
 }
 
 func (c *Cluster) trackMonInOrOutOfQuorum(monName string, inQuorum bool) (bool, error) {
@@ -463,6 +447,7 @@ func (c *Cluster) determineExtraMonToRemove() string {
 	for _, mon := range mons {
 		if mon.NodeName == "" {
 			logger.Debugf("mon %q is not scheduled to a specific host", mon.DaemonName)
+			arbitraryMon = mon.DaemonName
 			continue
 		}
 		// Check if there are multiple mons on the node
@@ -533,11 +518,6 @@ func (c *Cluster) failMon(monCount, desiredMonCount int, name string) bool {
 		return true
 	}
 
-	if err := c.allowFailover(name); err != nil {
-		logger.Warningf("aborting mon %q failover. %v", name, err)
-		return false
-	}
-
 	// prevent any voluntary mon drain while failing over
 	if err := c.blockMonDrain(types.NamespacedName{Name: monPDBName, Namespace: c.Namespace}); err != nil {
 		logger.Errorf("failed to block mon drain. %v", err)
@@ -553,24 +533,6 @@ func (c *Cluster) failMon(monCount, desiredMonCount int, name string) bool {
 		logger.Errorf("failed to allow mon drain. %v", err)
 	}
 	return true
-}
-
-func (c *Cluster) allowFailover(name string) error {
-	if !c.spec.IsStretchCluster() {
-		// always failover if not a stretch cluster
-		return nil
-	}
-	if name != c.arbiterMon {
-		// failover if it's a non-arbiter
-		return nil
-	}
-	if c.ClusterInfo.CephVersion.IsAtLeast(arbiterFailoverSupportedCephVersion) {
-		// failover the arbiter if at least v16.2.7
-		return nil
-	}
-
-	// Ceph does not support updating the arbiter mon in older versions
-	return errors.Errorf("refusing to failover arbiter mon %q on a stretched cluster until upgrading to ceph version %s", name, arbiterFailoverSupportedCephVersion.String())
 }
 
 func (c *Cluster) removeOrphanMonResources() {
@@ -749,20 +711,6 @@ func (c *Cluster) removeMonWithOptionalQuorum(daemonName string, shouldRemoveFro
 	}
 	logger.Infof("ensuring removal of unhealthy monitor %s", daemonName)
 
-	resourceName := resourceName(daemonName)
-
-	// Remove the mon pod if it is still there
-	var gracePeriod int64
-	propagation := metav1.DeletePropagationForeground
-	options := &metav1.DeleteOptions{GracePeriodSeconds: &gracePeriod, PropagationPolicy: &propagation}
-	if err := c.context.Clientset.AppsV1().Deployments(c.Namespace).Delete(c.ClusterInfo.Context, resourceName, *options); err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Infof("dead mon %s was already gone", resourceName)
-		} else {
-			logger.Errorf("failed to remove dead mon deployment %q. %v", resourceName, err)
-		}
-	}
-
 	// Remove the bad monitor from quorum
 	if shouldRemoveFromQuorum {
 		if err := c.removeMonitorFromQuorum(daemonName); err != nil {
@@ -770,10 +718,33 @@ func (c *Cluster) removeMonWithOptionalQuorum(daemonName string, shouldRemoveFro
 		}
 	}
 	delete(c.ClusterInfo.Monitors, daemonName)
-
 	delete(c.mapping.Schedule, daemonName)
 
+	if err := c.saveMonConfig(); err != nil {
+		return errors.Wrapf(err, "failed to save mon config after failing over mon %s", daemonName)
+	}
+
+	// Update cluster-wide RBD bootstrap peer token since Monitors have changed
+	_, err := controller.CreateBootstrapPeerSecret(c.context, c.ClusterInfo, &cephv1.CephCluster{ObjectMeta: metav1.ObjectMeta{Name: c.ClusterInfo.NamespacedName().Name, Namespace: c.Namespace}}, c.ownerInfo)
+	if err != nil {
+		return errors.Wrap(err, "failed to update cluster rbd bootstrap peer token")
+	}
+
+	// When the mon is removed from quorum, it is possible that the operator will be restarted
+	// before the mon pod is deleted. In this case, the operator will need to delete the mon
+	// during the next reconcile. If the reconcile finds an extra mon pod, it will be removed
+	// at that later reconcile. Thus, we delete the mon pod last during the failover
+	// and in case the failover is interrupted, the operator can detect the resources to finish the cleanup.
+	c.removeMonResources(daemonName)
+	return nil
+}
+
+func (c *Cluster) removeMonResources(daemonName string) {
 	// Remove the service endpoint
+	resourceName := resourceName(daemonName)
+	var gracePeriod int64
+	propagation := metav1.DeletePropagationForeground
+	options := &metav1.DeleteOptions{GracePeriodSeconds: &gracePeriod, PropagationPolicy: &propagation}
 	if err := c.context.Clientset.CoreV1().Services(c.Namespace).Delete(c.ClusterInfo.Context, resourceName, *options); err != nil {
 		if kerrors.IsNotFound(err) {
 			logger.Infof("dead mon service %s was already gone", resourceName)
@@ -791,17 +762,14 @@ func (c *Cluster) removeMonWithOptionalQuorum(daemonName string, shouldRemoveFro
 		}
 	}
 
-	if err := c.saveMonConfig(); err != nil {
-		return errors.Wrapf(err, "failed to save mon config after failing over mon %s", daemonName)
+	// Remove the mon pod if it is still there
+	if err := c.context.Clientset.AppsV1().Deployments(c.Namespace).Delete(c.ClusterInfo.Context, resourceName, *options); err != nil {
+		if kerrors.IsNotFound(err) {
+			logger.Infof("dead mon %s was already gone", resourceName)
+		} else {
+			logger.Errorf("failed to remove dead mon deployment %q. %v", resourceName, err)
+		}
 	}
-
-	// Update cluster-wide RBD bootstrap peer token since Monitors have changed
-	_, err := controller.CreateBootstrapPeerSecret(c.context, c.ClusterInfo, &cephv1.CephCluster{ObjectMeta: metav1.ObjectMeta{Name: c.ClusterInfo.NamespacedName().Name, Namespace: c.Namespace}}, c.ownerInfo)
-	if err != nil {
-		return errors.Wrap(err, "failed to update cluster rbd bootstrap peer token")
-	}
-
-	return nil
 }
 
 func (c *Cluster) removeMonitorFromQuorum(name string) error {

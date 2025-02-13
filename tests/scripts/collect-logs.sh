@@ -5,7 +5,7 @@ set -x
 # User parameters
 : "${CLUSTER_NAMESPACE:="rook-ceph"}"
 : "${OPERATOR_NAMESPACE:="$CLUSTER_NAMESPACE"}"
-: "${KUBE_SYSTEM_NAMESPACE:="kube-system"}"
+: "${ADDITIONAL_NAMESPACE:=""}"
 : "${LOG_DIR:="test"}"
 
 LOG_DIR="${LOG_DIR%/}" # remove trailing slash if necessary
@@ -18,9 +18,12 @@ $CEPH_CMD osd dump >"${LOG_DIR}"/ceph-osd-dump.txt
 $CEPH_CMD report >"${LOG_DIR}"/ceph-report.txt
 
 NAMESPACES=("$CLUSTER_NAMESPACE")
-NAMESPACES+=("$KUBE_SYSTEM_NAMESPACE")
 if [[ "$OPERATOR_NAMESPACE" != "$CLUSTER_NAMESPACE" ]]; then
   NAMESPACES+=("$OPERATOR_NAMESPACE")
+fi
+
+if [[ -n "${ADDITIONAL_NAMESPACE}" ]]; then
+  NAMESPACES+=("${ADDITIONAL_NAMESPACE}")
 fi
 
 for NAMESPACE in "${NAMESPACES[@]}"; do
@@ -44,7 +47,7 @@ for NAMESPACE in "${NAMESPACES[@]}"; do
   # secret need `-oyaml` to read the content instead of `describe` since secrets `describe` will be encrypted.
   # so keeping it in a different block.
   for secret in $(kubectl -n "$NAMESPACE" get secrets -o jsonpath='{.items[*].metadata.name}'); do
-    kubectl -n "$NAMESPACE" get -o yaml secret "$secret" >"${NS_DIR}"/secret-describe--"$secret".txt
+    kubectl -n "$NAMESPACE" get -o yaml secret "$secret" >"${NS_DIR}"/secret-get--"$secret".txt
   done
 
   # describe every one of the custom resources in the namespace since all should be rook-related and
@@ -52,7 +55,7 @@ for NAMESPACE in "${NAMESPACES[@]}"; do
   for CRD in $(kubectl get crds -o jsonpath='{.items[*].metadata.name}'); do
     for resource in $(kubectl -n "$NAMESPACE" get "$CRD" -o jsonpath='{.items[*].metadata.name}'); do
       crd_main_type="${CRD%%.*}" # e.g., for cephclusters.ceph.rook.io, only use 'cephclusters'
-      kubectl -n "$NAMESPACE" get -o yaml "$CRD" "$resource" >"${NS_DIR}"/"$crd_main_type"-describe--"$resource".txt
+      kubectl -n "$NAMESPACE" describe "$CRD" "$resource" >"${NS_DIR}"/"$crd_main_type"-describe--"$resource".txt
     done
   done
 

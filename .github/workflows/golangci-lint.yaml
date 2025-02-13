@@ -24,23 +24,26 @@ jobs:
     name: golangci-lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
-          go-version: "1.21"
+          go-version: "1.23"
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v3
+        uses: golangci/golangci-lint-action@2e788936b09dd82dc280e845628a40d2ba6b204c # v6.3.1
         with:
           # Required: the version of golangci-lint is required and must be specified without patch version: we always use the latest patch version.
-          version: v1.53
+          version: v1.62
 
           # Optional: working directory, useful for monorepos
           # working-directory: somedir
 
           # Optional: golangci-lint command line arguments.
-          args: -E gosec --timeout=10m
+          args: -E gosec -E gofmt --timeout=10m
+
+          # actions/setup-go already handles caching
+          skip-cache: true
 
           # Optional: show only new issues if it's a pull request. The default value is `false`.
           # only-new-issues: true
@@ -49,8 +52,9 @@ jobs:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
-         go-version: "1.21.4"
+         go-version: "1.23"
+         check-latest: true
       - name: govulncheck
-        uses: golang/govulncheck-action@v1
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4

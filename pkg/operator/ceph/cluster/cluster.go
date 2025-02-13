@@ -20,6 +20,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -251,13 +252,6 @@ func (c *ClusterController) configureLocalCephCluster(cluster *cluster) error {
 	// Set the value of isUpgrade based on the image discovery done by detectAndValidateCephVersion()
 	cluster.isUpgrade = isUpgrade
 
-	if cluster.Spec.IsStretchCluster() {
-		stretchVersion := cephver.CephVersion{Major: 16, Minor: 2, Build: 5}
-		if !cephVersion.IsAtLeast(stretchVersion) {
-			return errors.Errorf("stretch clusters minimum ceph version is %q, but is running %s", stretchVersion.String(), cephVersion.String())
-		}
-	}
-
 	if cluster.Spec.Network.MultiClusterService.Enabled {
 		serviceExportVersion := cephver.CephVersion{Major: 17, Minor: 2, Extra: 6}
 		if !cephVersion.IsAtLeast(serviceExportVersion) {
@@ -458,25 +452,31 @@ func (c *cluster) preMonStartupActions(cephVersion cephver.CephVersion) error {
 // Basically, it is executed between the monitors and the manager sequence
 func (c *cluster) postMonStartupActions() error {
 	// Create CSI Kubernetes Secrets
-	err := csi.CreateCSISecrets(c.context, c.ClusterInfo)
-	if err != nil {
+	if err := csi.CreateCSISecrets(c.context, c.ClusterInfo); err != nil {
 		return errors.Wrap(err, "failed to create csi kubernetes secrets")
 	}
 
 	// Create crash collector Kubernetes Secret
-	err = nodedaemon.CreateCrashCollectorSecret(c.context, c.ClusterInfo)
-	if err != nil {
+	if err := nodedaemon.CreateCrashCollectorSecret(c.context, c.ClusterInfo); err != nil {
 		return errors.Wrap(err, "failed to create crash collector kubernetes secret")
 	}
 
 	// Create exporter Kubernetes Secret
-	err = nodedaemon.CreateExporterSecret(c.context, c.ClusterInfo)
-	if err != nil {
+	if err := nodedaemon.CreateExporterSecret(c.context, c.ClusterInfo); err != nil {
 		return errors.Wrap(err, "failed to create exporter kubernetes secret")
 	}
 
 	if err := c.configureMsgr2(); err != nil {
 		return errors.Wrap(err, "failed to configure msgr2")
+	}
+
+	// Set config store options
+	if err := c.updateConfigStoreFromCRD(); err != nil {
+		return errors.Wrap(err, "")
+	}
+
+	if err := c.configureStorageSettings(); err != nil {
+		return errors.Wrap(err, "failed to configure storage settings")
 	}
 
 	crushRoot := client.GetCrushRootFromSpec(c.Spec)
@@ -490,12 +490,75 @@ func (c *cluster) postMonStartupActions() error {
 	}
 
 	// Create cluster-wide RBD bootstrap peer token
-	_, err = controller.CreateBootstrapPeerSecret(c.context, c.ClusterInfo, &cephv1.CephCluster{ObjectMeta: metav1.ObjectMeta{Name: c.namespacedName.Name, Namespace: c.Namespace}}, c.ownerInfo)
-	if err != nil {
+	if _, err := controller.CreateBootstrapPeerSecret(c.context, c.ClusterInfo, &cephv1.CephCluster{ObjectMeta: metav1.ObjectMeta{Name: c.namespacedName.Name, Namespace: c.Namespace}}, c.ownerInfo); err != nil {
 		return errors.Wrap(err, "failed to create cluster rbd bootstrap peer token")
 	}
 
 	return nil
+}
+
+func (c *cluster) configureStorageSettings() error {
+	if !c.shouldSetClusterFullSettings() {
+		return nil
+	}
+	osdDump, err := client.GetOSDDump(c.context, c.ClusterInfo)
+	if err != nil {
+		return errors.Wrap(err, "failed to get osd dump for setting cluster full settings")
+	}
+
+	if err := c.setClusterFullRatio("set-full-ratio", c.Spec.Storage.FullRatio, osdDump.FullRatio); err != nil {
+		return err
+	}
+
+	if err := c.setClusterFullRatio("set-backfillfull-ratio", c.Spec.Storage.BackfillFullRatio, osdDump.BackfillFullRatio); err != nil {
+		return err
+	}
+
+	if err := c.setClusterFullRatio("set-nearfull-ratio", c.Spec.Storage.NearFullRatio, osdDump.NearFullRatio); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *cluster) setClusterFullRatio(ratioCommand string, desiredRatio *float64, actualRatio float64) error {
+	if !shouldUpdateFloatSetting(desiredRatio, actualRatio) {
+		if desiredRatio != nil {
+			logger.Infof("desired value %s=%.2f is already set", ratioCommand, *desiredRatio)
+		}
+		return nil
+	}
+	desiredStringVal := fmt.Sprintf("%.2f", *desiredRatio)
+	logger.Infof("updating %s from %.2f to %s", ratioCommand, actualRatio, desiredStringVal)
+	args := []string{"osd", ratioCommand, desiredStringVal}
+	cephCmd := client.NewCephCommand(c.context, c.ClusterInfo, args)
+	output, err := cephCmd.Run()
+	if err != nil {
+		return errors.Wrapf(err, "failed to update %s to %q. %s", ratioCommand, desiredStringVal, output)
+	}
+	return nil
+}
+
+func shouldUpdateFloatSetting(desired *float64, actual float64) bool {
+	if desired == nil {
+		return false
+	}
+	if *desired == actual {
+		return false
+	}
+	if actual != 0 && math.Abs(*desired-actual)/actual > 0.01 {
+		return true
+	}
+	return false
+}
+
+func (c *cluster) shouldSetClusterFullSettings() bool {
+	return c.Spec.Storage.FullRatio != nil || c.Spec.Storage.BackfillFullRatio != nil || c.Spec.Storage.NearFullRatio != nil
+}
+
+func (c *cluster) updateConfigStoreFromCRD() error {
+	monStore := config.GetMonStore(c.context, c.ClusterInfo)
+	return monStore.SetAllMultiple(c.Spec.CephConfig)
 }
 
 func (c *cluster) reportTelemetry() {
@@ -650,26 +713,21 @@ func (c *cluster) configureMsgr2() error {
 		}
 	}
 	// Set network compression
-	if c.ClusterInfo.CephVersion.IsAtLeastQuincy() {
-		if c.Spec.Network.Connections == nil || c.Spec.Network.Connections.Compression == nil || !c.Spec.Network.Connections.Compression.Enabled {
-			encryptionConfig := []config.Option{
-				{Who: "global", Option: "ms_osd_compress_mode"},
-			}
-			if err := monStore.DeleteAll(encryptionConfig...); err != nil {
-				return errors.Wrap(err, "failed to delete msgr2 compression settings")
-			}
-		} else {
-			globalConfigSettings := map[string]string{
-				"ms_osd_compress_mode": "force",
-			}
-			logger.Infof("setting msgr2 compression mode to %q", "force")
-			if err := monStore.SetAll("global", globalConfigSettings); err != nil {
-				return err
-			}
+	if c.Spec.Network.Connections == nil || c.Spec.Network.Connections.Compression == nil || !c.Spec.Network.Connections.Compression.Enabled {
+		encryptionConfig := []config.Option{
+			{Who: "global", Option: "ms_osd_compress_mode"},
 		}
-
+		if err := monStore.DeleteAll(encryptionConfig...); err != nil {
+			return errors.Wrap(err, "failed to delete msgr2 compression settings")
+		}
 	} else {
-		logger.Warningf("network compression requires Ceph Quincy (v17) or newer, skipping for current ceph %q", c.ClusterInfo.CephVersion.String())
+		globalConfigSettings := map[string]string{
+			"ms_osd_compress_mode": "force",
+		}
+		logger.Infof("setting msgr2 compression mode to %q", "force")
+		if err := monStore.SetAll("global", globalConfigSettings); err != nil {
+			return err
+		}
 	}
 
 	return nil

@@ -20,6 +20,7 @@ package cluster
 import (
 	"context"
 
+	cephcsi "github.com/ceph/ceph-csi/api/deploy/kubernetes"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
@@ -107,12 +108,6 @@ func (c *ClusterController) configureExternalCephCluster(cluster *cluster) error
 		}
 	}
 
-	// Create CSI config map
-	err = csi.CreateCsiConfigMap(c.OpManagerCtx, c.namespacedName.Namespace, c.context.Clientset, cluster.ownerInfo)
-	if err != nil {
-		return errors.Wrap(err, "failed to create csi config map")
-	}
-
 	// update the msgr2 flag
 	for _, m := range cluster.ClusterInfo.Monitors {
 		// m.Endpoint=10.1.115.104:3300
@@ -129,7 +124,15 @@ func (c *ClusterController) configureExternalCephCluster(cluster *cluster) error
 
 	// Save CSI configmap
 	monEndpoints := csi.MonEndpoints(cluster.ClusterInfo.Monitors, cluster.Spec.RequireMsgr2())
-	err = csi.SaveClusterConfig(c.context.Clientset, c.namespacedName.Namespace, cluster.ClusterInfo, &csi.CsiClusterConfigEntry{Namespace: cluster.ClusterInfo.Namespace, Monitors: monEndpoints})
+	csiConfigEntry := &csi.CSIClusterConfigEntry{
+		Namespace: cluster.ClusterInfo.Namespace,
+		ClusterInfo: cephcsi.ClusterInfo{
+			Monitors: monEndpoints,
+		},
+	}
+
+	clusterId := c.namespacedName.Namespace // cluster id is same as cluster namespace for CephClusters
+	err = csi.SaveClusterConfig(c.context.Clientset, clusterId, c.namespacedName.Namespace, cluster.ClusterInfo, csiConfigEntry)
 	if err != nil {
 		return errors.Wrap(err, "failed to update csi cluster config")
 	}
@@ -140,6 +143,17 @@ func (c *ClusterController) configureExternalCephCluster(cluster *cluster) error
 		err = nodedaemon.CreateCrashCollectorSecret(c.context, cluster.ClusterInfo)
 		if err != nil {
 			return errors.Wrap(err, "failed to create crash collector kubernetes secret")
+		}
+	}
+	// Create exporter secret
+	if !cluster.Spec.Monitoring.MetricsDisabled {
+		if cluster.ClusterInfo.CephCred.Username == client.AdminUsername &&
+			cluster.ClusterInfo.CephCred.Secret != opcontroller.AdminSecretNameKey {
+
+			err = nodedaemon.CreateExporterSecret(c.context, cluster.ClusterInfo)
+			if err != nil {
+				return errors.Wrap(err, "failed to create exporter kubernetes secret")
+			}
 		}
 	}
 
